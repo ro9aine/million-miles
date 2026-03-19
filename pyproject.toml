@@ -1,0 +1,28 @@
+[project]
+name = "million-miles"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "ro9aine"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn[standard]>=0.32.0,<1.0.0",
+]
+
+[project.scripts]
+back-dev = "back.runner:dev"
+back-start = "back.runner:start"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [
+    { include = "back" },
+    { include = "parser" },
+]
