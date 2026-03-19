@@ -12,12 +12,13 @@ services:
       dockerfile: Dockerfile.backend
     container_name: million-miles-api
     environment:
-      CORS_ORIGIN: http://localhost:3000
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       DATABASE_PATH: /app/back/data/million_miles.db
-      STARTUP_SYNC_ENABLED: "1"
-      SYNC_INTERVAL_SECONDS: "3600"
+      STARTUP_SYNC_ENABLED: ${STARTUP_SYNC_ENABLED:-1}
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
     ports:
       - "8000:8000"
     volumes:
@@ -42,7 +43,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       DATABASE_PATH: /app/back/data/million_miles.db
-      SYNC_INTERVAL_SECONDS: "3600"
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
     volumes:
       - backend_data:/app/back/data
     depends_on:
@@ -68,7 +69,7 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       DATABASE_PATH: /app/back/data/million_miles.db
-      SYNC_INTERVAL_SECONDS: "3600"
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
     volumes:
       - backend_data:/app/back/data
       - beat_state:/app/.celery
@@ -92,7 +93,7 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     container_name: million-miles-front
     ports:
       - "3000:3000"
