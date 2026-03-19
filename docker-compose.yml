@@ -1,0 +1,111 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: million-miles-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: million-miles-api
+    environment:
+      CORS_ORIGIN: http://localhost:3000
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      DATABASE_PATH: /app/back/data/million_miles.db
+      STARTUP_SYNC_ENABLED: "1"
+      SYNC_INTERVAL_SECONDS: "3600"
+      SYNC_MAX_PAGES: "2"
+      SYNC_MAX_LISTINGS: "40"
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_data:/app/back/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - back.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: million-miles-worker
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      DATABASE_PATH: /app/back/data/million_miles.db
+      SYNC_INTERVAL_SECONDS: "3600"
+      SYNC_MAX_PAGES: "2"
+      SYNC_MAX_LISTINGS: "40"
+    volumes:
+      - backend_data:/app/back/data
+    depends_on:
+      - redis
+      - api
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - celery
+      - -A
+      - back.celery_app:celery_app
+      - worker
+      - --loglevel=info
+      - --pool=solo
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: million-miles-beat
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      DATABASE_PATH: /app/back/data/million_miles.db
+      SYNC_INTERVAL_SECONDS: "3600"
+      SYNC_MAX_PAGES: "2"
+      SYNC_MAX_LISTINGS: "40"
+    volumes:
+      - backend_data:/app/back/data
+      - beat_state:/app/.celery
+    depends_on:
+      - redis
+      - worker
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - celery
+      - -A
+      - back.celery_app:celery_app
+      - beat
+      - --loglevel=info
+      - --schedule
+      - /app/.celery/celerybeat-schedule
+
+  front:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    container_name: million-miles-front
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  backend_data:
+  beat_state:

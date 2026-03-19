@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Million Miles",
-  description: "Next.js frontend for Million Miles",
+  title: "Million Miles Inventory",
+  description: "Carsensor-backed inventory dashboard with JWT auth",
 };
 
 export default function RootLayout({

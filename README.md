@@ -1,56 +1,108 @@
 # Million Miles
 
+Test fullstack application for importing cars from `carsensor.net`, storing them in SQLite, exposing them through FastAPI, and browsing them in Next.js.
+
+## Implemented
+
+- live `CarSensorParser` based on `requests` and `BeautifulSoup`
+- field content localization to `ja`, `en`, `ru`
+- SQLite storage
+- JWT auth with `admin / admin123`
+- FastAPI backend:
+  - `POST /auth/login`
+  - `GET /cars`
+  - `GET /cars/{listing_id}`
+  - `POST /sync`
+  - `GET /sync/meta`
+- Celery worker for scraping
+- Celery Beat watchdog schedule
+- database update immediately after each parsed car record
+- Next.js frontend:
+  - login page
+  - inventory list
+  - filters, sorting, pagination
+  - detail page
+  - language switcher
+
 ## Backend
 
-Install Python dependencies, then run the FastAPI app:
+Install dependencies:
 
 ```bash
-pip install -e .
-uvicorn back.main:app --reload
+poetry install
 ```
 
-The API health endpoint is available at `http://localhost:8000/health`.
-
-## CarSensor CLI
-
-Run the live parser against Carsensor result or detail pages:
+Run API:
 
 ```bash
-pip install -e .
-carsensor-parse --limit 3
+poetry run back-dev
 ```
 
-Translate field content in the output:
+By default backend:
+
+- initializes SQLite at `back/data/million_miles.db`
+- creates user `admin / admin123`
+- if `STARTUP_SYNC_ENABLED=1`, enqueues immediate sync-check task into Celery
+
+Environment variables:
 
 ```bash
-carsensor-parse --limit 1 --lang en
-carsensor-parse --limit 1 --lang ru
+JWT_SECRET=change-me
+CORS_ORIGIN=http://localhost:3000
+CELERY_BROKER_URL=redis://127.0.0.1:6379/0
+CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/0
+SYNC_INTERVAL_SECONDS=3600
+SYNC_MAX_PAGES=2
+SYNC_MAX_LISTINGS=40
+STARTUP_SYNC_ENABLED=1
+DATABASE_PATH=back/data/million_miles.db
 ```
 
-Parse a specific detail page:
+Healthcheck:
 
 ```bash
-carsensor-parse --url https://www.carsensor.net/usedcar/detail/AU6897426683/index.html
+http://localhost:8000/health
 ```
 
-Write JSON to a file:
+## Celery
+
+Redis is required as broker/backend.
+
+Example local Redis with Docker:
 
 ```bash
-carsensor-parse --limit 10 --output carsensor.json
+docker run --name million-miles-redis -p 6379:6379 redis:7
 ```
 
-Use the parser from Python:
+Run worker:
 
-```python
-from parser import CarSensorParser
+```bash
+poetry run back-worker
+```
 
-parser = CarSensorParser()
-listings = parser.crawl(max_pages=1, max_listings=3)
+Run beat:
+
+```bash
+poetry run back-beat
+```
+
+`beat` checks once per minute whether a new sync is due. A sync starts immediately on startup, then the next one becomes eligible only after `SYNC_INTERVAL_SECONDS` have passed since the previous sync finished. `worker` updates the database immediately after every parsed car.
+
+Manual sync is also available through:
+
+```bash
+POST /sync
 ```
 
 ## Frontend
 
-Install frontend dependencies inside `front/`, then start Next.js:
+Create `front/.env.local`:
+
+```bash
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+Run frontend:
 
 ```bash
 cd front
@@ -58,4 +110,77 @@ npm install
 npm run dev
 ```
 
-Set `NEXT_PUBLIC_API_URL` if the backend is not running on `http://localhost:8000`.
+The app will be available at `http://localhost:3000`.
+
+## Full Local Run
+
+Terminal 1:
+
+```bash
+poetry run back-dev
+```
+
+Terminal 2:
+
+```bash
+poetry run back-worker
+```
+
+Terminal 3:
+
+```bash
+poetry run back-beat
+```
+
+Terminal 4:
+
+```bash
+cd front
+npm run dev
+```
+
+## Docker Compose
+
+Full stack with Redis, API, Celery worker, Celery beat, and frontend:
+
+```bash
+docker compose up --build
+```
+
+Services:
+
+- frontend: `http://localhost:3000`
+- api: `http://localhost:8000`
+- redis: `localhost:6379`
+
+Stop:
+
+```bash
+docker compose down
+```
+
+Reset containers and named volumes:
+
+```bash
+docker compose down -v
+```
+
+## Parser CLI
+
+```bash
+poetry run carsensor-parse --limit 3
+poetry run carsensor-parse --limit 1 --lang en
+poetry run carsensor-parse --url https://www.carsensor.net/usedcar/detail/AU6897426683/index.html --lang ru
+```
+
+## Auth
+
+- login: `admin`
+- password: `admin123`
+
+## Localization And Filtering
+
+- scraper keeps canonical source data
+- backend stores Japanese source plus localized `en/ru` payloads
+- filtering and sorting work on normalized keys and numeric columns
+- frontend requests localized content with `lang=ja|en|ru`

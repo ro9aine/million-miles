@@ -120,10 +120,24 @@ class CarSensorParser:
         max_pages: int = 1,
         max_listings: int | None = None,
     ) -> list[CarListing]:
-        listings: list[CarListing] = []
+        return list(
+            self.iter_listings(
+                start_url=start_url,
+                max_pages=max_pages,
+                max_listings=max_listings,
+            )
+        )
+
+    def iter_listings(
+        self,
+        start_url: str = DEFAULT_SEARCH_URL,
+        max_pages: int = 1,
+        max_listings: int | None = None,
+    ):
         seen_listing_urls: set[str] = set()
         current_url = start_url
         pages_fetched = 0
+        yielded = 0
 
         while current_url and pages_fetched < max_pages:
             html = self._fetch_html(current_url)
@@ -134,13 +148,12 @@ class CarSensorParser:
                 if preview.url in seen_listing_urls:
                     continue
                 seen_listing_urls.add(preview.url)
-                listings.append(self.fetch_listing(preview.url, preview=preview))
-                if max_listings is not None and len(listings) >= max_listings:
-                    return listings
+                yield self.fetch_listing(preview.url, preview=preview)
+                yielded += 1
+                if max_listings is not None and yielded >= max_listings:
+                    return
 
             current_url = next_url
-
-        return listings
 
     def fetch_listing(self, url: str, preview: ListingPreview | None = None) -> CarListing:
         html = self._fetch_html(url)
@@ -474,14 +487,19 @@ class CarSensorParser:
     def _normalize_image_url(self, url: str | None) -> str | None:
         if not url:
             return None
-        if url.startswith("//"):
-            return f"https:{url}"
-        if url.startswith("/"):
-            return urljoin(BASE_URL, url)
-        if url.startswith("http"):
-            if url.count("https://") > 1:
-                return "https://" + url.split("https://")[-1]
-            return url
+        cleaned = url.strip()
+        duplicate_index = cleaned.find("https://", 8)
+        if duplicate_index > 0:
+            cleaned = cleaned[duplicate_index:]
+        duplicate_http_index = cleaned.find("http://", 7)
+        if duplicate_http_index > 0:
+            cleaned = cleaned[duplicate_http_index:]
+        if cleaned.startswith("//"):
+            return f"https:{cleaned}"
+        if cleaned.startswith("/"):
+            return urljoin(BASE_URL, cleaned)
+        if cleaned.startswith("http"):
+            return cleaned
         return None
 
     def _attr_or_none(self, node: Tag | None, attr: str) -> str | None:

@@ -17,7 +17,11 @@ htmlcov/
 front/node_modules/
 front/.next/
 front/dist/
+front/*.tsbuildinfo
+*.db
+back/data/
 recordings/
+celerybeat-schedule*
 
 .idea/
 .vscode/

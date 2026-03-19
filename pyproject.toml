@@ -9,18 +9,21 @@ readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "beautifulsoup4>=4.12.3,<5.0.0",
+    "celery[redis]>=5.4.0,<6.0.0",
     "deep-translator>=1.11.4,<2.0.0",
     "fastapi>=0.115.0,<1.0.0",
     "playwright>=1.52.0,<2.0.0",
     "requests>=2.32.3,<3.0.0",
+    "sqlalchemy>=2.0.36,<3.0.0",
     "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 
 [project.scripts]
 back-dev = "back.runner:dev"
 back-start = "back.runner:start"
+back-worker = "back.runner:celery_worker"
+back-beat = "back.runner:celery_beat"
 carsensor-parse = "parser.carsensor:main"
-carsensor-record = "recorder.carsensor:main"
 
 
 [build-system]
@@ -31,5 +34,4 @@ build-backend = "poetry.core.masonry.api"
 packages = [
     { include = "back" },
     { include = "parser" },
-    { include = "recorder" },
 ]
