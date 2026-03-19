@@ -17,6 +17,7 @@ htmlcov/
 front/node_modules/
 front/.next/
 front/dist/
+recordings/
 
 .idea/
 .vscode/
