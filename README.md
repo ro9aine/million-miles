@@ -49,6 +49,7 @@ Environment variables:
 ```bash
 JWT_SECRET=change-me
 CORS_ORIGIN=http://localhost:3000
+AUTH_COOKIE_SECURE=true
 CELERY_BROKER_URL=redis://127.0.0.1:6379/0
 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/0
 SYNC_INTERVAL_SECONDS=3600
@@ -146,6 +147,28 @@ Full stack with Redis, API, Celery worker, Celery beat, and frontend:
 ```bash
 docker compose up --build
 ```
+
+Compose overrides can be supplied through a root `.env` file. The included
+[`deploy.env.example`](./deploy.env.example) shows the required values for a plain HTTP
+server deployment:
+
+```bash
+cp deploy.env.example .env
+docker compose up -d --build
+```
+
+Relevant compose variables:
+
+```bash
+CORS_ORIGIN=http://your-server:3000
+NEXT_PUBLIC_API_URL=http://your-server:8000
+AUTH_COOKIE_SECURE=false
+STARTUP_SYNC_ENABLED=1
+SYNC_INTERVAL_SECONDS=3600
+```
+
+Set `AUTH_COOKIE_SECURE=false` only when serving over plain HTTP. For HTTPS deployments,
+keep it `true`.
 
 Services:
 
