@@ -8,11 +8,13 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
+    "aiohttp>=3.11.0,<4.0.0",
     "beautifulsoup4>=4.12.3,<5.0.0",
     "celery[redis]>=5.4.0,<6.0.0",
     "deep-translator>=1.11.4,<2.0.0",
     "fastapi>=0.115.0,<1.0.0",
     "playwright>=1.52.0,<2.0.0",
+    "pydantic>=2.10.0,<3.0.0",
     "pydantic-settings>=2.7.1,<3.0.0",
     "requests>=2.32.3,<3.0.0",
     "sqlalchemy>=2.0.36,<3.0.0",
@@ -24,7 +26,7 @@ back-dev = "back.runner:dev"
 back-start = "back.runner:start"
 back-worker = "back.runner:celery_worker"
 back-beat = "back.runner:celery_beat"
-carsensor-parse = "parser.carsensor:main"
+carsensor-parse = "parser.cli:main"
 
 
 [build-system]

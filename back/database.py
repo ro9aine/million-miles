@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Integer, String, Text, create_engine, func, or_, select
+from sqlalchemy import Integer, String, Text, create_engine, func, inspect, or_, select, text
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -95,6 +95,29 @@ class SyncStateRecord(Base):
     is_running: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_started_at: Mapped[str | None] = mapped_column(String)
     last_finished_at: Mapped[str | None] = mapped_column(String)
+    last_succeeded_at: Mapped[str | None] = mapped_column(String)
+
+
+class FailedResultPageRecord(Base):
+    __tablename__ = "failed_result_pages"
+
+    page_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    page_url: Mapped[str] = mapped_column(String, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_failed_at: Mapped[str] = mapped_column(String, nullable=False)
+    last_failed_at: Mapped[str] = mapped_column(String, nullable=False)
+
+
+class FailedDetailPageRecord(Base):
+    __tablename__ = "failed_detail_pages"
+
+    listing_url: Mapped[str] = mapped_column(String, primary_key=True)
+    listing_id: Mapped[str | None] = mapped_column(String, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    first_failed_at: Mapped[str] = mapped_column(String, nullable=False)
+    last_failed_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
 class Database:
@@ -114,6 +137,7 @@ class Database:
 
     def init(self) -> None:
         Base.metadata.create_all(self.engine)
+        self._migrate_schema()
 
     def session(self) -> Session:
         return self.session_factory()
@@ -168,6 +192,154 @@ class Database:
                 .where(CarRecord.listing_id == listing_id)
             )
         return bool(value)
+
+    def get_cars_missing_localization(self, limit: int) -> list[dict[str, Any]]:
+        with self.session() as session:
+            rows = session.scalars(
+                select(CarRecord)
+                .where(
+                    or_(
+                        CarRecord.payload_en == CarRecord.payload_ja,
+                        CarRecord.payload_ru == CarRecord.payload_ja,
+                    )
+                )
+                .order_by(CarRecord.synced_at.asc(), CarRecord.listing_id.asc())
+                .limit(limit)
+            ).all()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            missing_langs: list[str] = []
+            if row.payload_en == row.payload_ja:
+                missing_langs.append("en")
+            if row.payload_ru == row.payload_ja:
+                missing_langs.append("ru")
+            if not missing_langs:
+                continue
+            result.append(
+                {
+                    "listing_id": row.listing_id,
+                    "payload_ja": json.loads(row.payload_ja),
+                    "missing_langs": missing_langs,
+                }
+            )
+        return result
+
+    def update_car_localizations(self, listing_id: str, localized_values: dict[str, Any]) -> None:
+        with self._write_lock, self.session() as session:
+            record = session.get(CarRecord, listing_id)
+            if record is None:
+                return
+
+            for key, value in localized_values.items():
+                setattr(record, key, value)
+            session.commit()
+
+    def record_failed_result_page(self, *, page_number: int, page_url: str, error: str) -> None:
+        timestamp = _utc_now()
+        with self._write_lock, self.session() as session:
+            record = session.get(FailedResultPageRecord, page_number)
+            if record is None:
+                record = FailedResultPageRecord(
+                    page_number=page_number,
+                    page_url=page_url,
+                    last_error=error,
+                    attempts=1,
+                    first_failed_at=timestamp,
+                    last_failed_at=timestamp,
+                )
+                session.add(record)
+            else:
+                record.page_url = page_url
+                record.last_error = error
+                record.attempts += 1
+                record.last_failed_at = timestamp
+            session.commit()
+
+    def clear_failed_result_page(self, page_number: int) -> None:
+        with self._write_lock, self.session() as session:
+            record = session.get(FailedResultPageRecord, page_number)
+            if record is not None:
+                session.delete(record)
+                session.commit()
+
+    def list_failed_result_pages(self, limit: int | None = None) -> list[dict[str, Any]]:
+        with self.session() as session:
+            query = select(FailedResultPageRecord).order_by(
+                FailedResultPageRecord.last_failed_at.asc(),
+                FailedResultPageRecord.page_number.asc(),
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            rows = session.scalars(query).all()
+
+        return [
+            {
+                "page_number": row.page_number,
+                "page_url": row.page_url,
+                "last_error": row.last_error,
+                "attempts": row.attempts,
+            }
+            for row in rows
+        ]
+
+    def count_failed_result_pages(self) -> int:
+        with self.session() as session:
+            value = session.scalar(select(func.count()).select_from(FailedResultPageRecord))
+        return int(value or 0)
+
+    def record_failed_detail_page(self, *, listing_id: str | None, listing_url: str, error: str) -> None:
+        timestamp = _utc_now()
+        with self._write_lock, self.session() as session:
+            record = session.get(FailedDetailPageRecord, listing_url)
+            if record is None:
+                record = FailedDetailPageRecord(
+                    listing_url=listing_url,
+                    listing_id=listing_id,
+                    last_error=error,
+                    attempts=1,
+                    first_failed_at=timestamp,
+                    last_failed_at=timestamp,
+                )
+                session.add(record)
+            else:
+                record.listing_id = listing_id or record.listing_id
+                record.last_error = error
+                record.attempts += 1
+                record.last_failed_at = timestamp
+            session.commit()
+
+    def clear_failed_detail_page(self, listing_url: str) -> None:
+        with self._write_lock, self.session() as session:
+            record = session.get(FailedDetailPageRecord, listing_url)
+            if record is not None:
+                session.delete(record)
+                session.commit()
+
+    def list_failed_detail_pages(self, limit: int | None = None) -> list[dict[str, Any]]:
+        with self.session() as session:
+            query = select(FailedDetailPageRecord).order_by(
+                FailedDetailPageRecord.last_failed_at.asc(),
+                FailedDetailPageRecord.listing_url.asc(),
+            )
+            if limit is not None:
+                query = query.limit(limit)
+            rows = session.scalars(query).all()
+
+        return [
+            {
+                "listing_id": row.listing_id,
+                "listing_url": row.listing_url,
+                "last_error": row.last_error,
+                "attempts": row.attempts,
+            }
+            for row in rows
+        ]
+
+    def count_failed_detail_pages(self) -> int:
+        with self.session() as session:
+            value = session.scalar(select(func.count()).select_from(FailedDetailPageRecord))
+        return int(value or 0)
 
     def list_cars(
         self,
@@ -240,7 +412,12 @@ class Database:
         with self.session() as session:
             count = session.scalar(select(func.count()).select_from(CarRecord)) or 0
             last_synced_at = session.scalar(select(func.max(CarRecord.synced_at)))
-        return {"count": int(count), "last_synced_at": last_synced_at}
+        return {
+            "count": int(count),
+            "last_synced_at": last_synced_at,
+            "failed_result_pages": self.count_failed_result_pages(),
+            "failed_detail_pages": self.count_failed_detail_pages(),
+        }
 
     def start_job_if_due(
         self,
@@ -259,12 +436,15 @@ class Database:
                 session.flush()
 
             if state.is_running:
-                session.rollback()
-                return False
+                if force:
+                    state.is_running = 0
+                else:
+                    session.rollback()
+                    return False
 
-            if not force and state.last_finished_at:
-                last_finished_at = datetime.fromisoformat(state.last_finished_at)
-                if (now - last_finished_at).total_seconds() < interval_seconds:
+            if not force and state.last_succeeded_at:
+                last_succeeded_at = datetime.fromisoformat(state.last_succeeded_at)
+                if (now - last_succeeded_at).total_seconds() < interval_seconds:
                     session.rollback()
                     return False
 
@@ -273,7 +453,7 @@ class Database:
             session.commit()
             return True
 
-    def finish_job(self, job_name: str) -> None:
+    def finish_job(self, job_name: str, *, succeeded: bool) -> None:
         with self._write_lock, self.session() as session:
             state = session.get(SyncStateRecord, job_name)
             if state is None:
@@ -281,7 +461,22 @@ class Database:
                 session.add(state)
             state.is_running = 0
             state.last_finished_at = _utc_now()
+            if succeeded:
+                state.last_succeeded_at = state.last_finished_at
             session.commit()
+
+    def _migrate_schema(self) -> None:
+        inspector = inspect(self.engine)
+        tables = set(inspector.get_table_names())
+        if "sync_state" not in tables:
+            return
+
+        columns = {column["name"] for column in inspector.get_columns("sync_state")}
+        if "last_succeeded_at" in columns:
+            return
+
+        with self.engine.begin() as connection:
+            connection.execute(text("ALTER TABLE sync_state ADD COLUMN last_succeeded_at VARCHAR"))
 
     def _apply_filters(
         self,

@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { apiRequest } from "../lib/api";
+import { ApiError, apiRequest } from "../lib/api";
 import { clearStoredToken, getStoredToken } from "../lib/auth";
 import { formatNumber, formatYen } from "../lib/format";
 import type { CarDetailResponse } from "../lib/types";
@@ -74,11 +74,19 @@ export function CarDetailPage({ listingId }: Props) {
           setDetailsOpen(false);
         }
       })
-      .catch(() => {
+      .catch((requestError: unknown) => {
         if (!cancelled) {
-          clearStoredToken();
+          if (requestError instanceof ApiError && requestError.status === 401) {
+            clearStoredToken();
+            setError("Session expired.");
+            router.replace("/login");
+            return;
+          }
+          if (requestError instanceof ApiError && requestError.status === 404) {
+            setError("Car not found.");
+            return;
+          }
           setError("Could not load the car.");
-          router.replace("/login");
         }
       })
       .finally(() => {

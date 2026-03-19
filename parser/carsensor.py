@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import argparse
+import asyncio
 import json
+import logging
 import re
-from dataclasses import asdict, dataclass, field
 from functools import lru_cache
-from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urljoin
 
-import requests
+import aiohttp
 from bs4 import BeautifulSoup, Tag
+
+from parser.models import CarListing, ListingPreview, PreviewPageResult
 
 try:
     from deep_translator import GoogleTranslator
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover - optional until dependencies are instal
 
 
 BASE_URL = "https://www.carsensor.net"
-DEFAULT_SEARCH_URL = f"{BASE_URL}/usedcar/index.html?NEW=1&SORT=19"
+DEFAULT_SEARCH_URL = f"{BASE_URL}/usedcar/index.html"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -31,6 +32,8 @@ PRICE_RE = re.compile(r"setting_data\.price\s*=\s*'(\d+),(\d+)'")
 YEAR_RE = re.compile(r"(\d{4})")
 SUPPORTED_LANGS = ("ja", "en", "ru")
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+RESULT_PAGE_RE = re.compile(r"/usedcar/index(\d+)\.html(?:[?#].*)?$", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 DETAIL_LABELS = {
     "body_type": ["ボディタイプ"],
@@ -50,142 +53,230 @@ DETAIL_LABELS = {
 }
 
 
-@dataclass(slots=True)
-class CarListing:
-    listing_id: str | None = None
-    make: str | None = None
-    model: str | None = None
-    trim: str | None = None
-    title: str | None = None
-    year: int | None = None
-    mileage_km: int | None = None
-    base_price_yen: int | None = None
-    total_price_yen: int | None = None
-    currency: str = "JPY"
-    url: str | None = None
-    location: str | None = None
-    color: str | None = None
-    body_type: str | None = None
-    fuel_type: str | None = None
-    transmission: str | None = None
-    drive_type: str | None = None
-    engine_volume_cc: int | None = None
-    doors: int | None = None
-    seats: int | None = None
-    inspection: str | None = None
-    repair_history: str | None = None
-    maintenance: str | None = None
-    guarantee: str | None = None
-    shop_name: str | None = None
-    shop_url: str | None = None
-    photos: list[str] = field(default_factory=list)
-    raw: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    def to_localized_dict(self, lang: str = "ja") -> dict[str, Any]:
-        translator = ContentTranslator(lang=lang)
-        return translator.translate_payload(self.to_dict())
-
-
-@dataclass(slots=True)
-class ListingPreview:
-    url: str
-    listing_id: str | None = None
-    make: str | None = None
-    title: str | None = None
-    base_price_yen: int | None = None
-    total_price_yen: int | None = None
-    year: int | None = None
-    mileage_km: int | None = None
-    image_url: str | None = None
-    shop_name: str | None = None
-    shop_url: str | None = None
+class ParserFetchError(RuntimeError):
+    pass
 
 
 class CarSensorParser:
-    def __init__(self, timeout: int = 30) -> None:
+    def __init__(self, timeout: int = 30, preview_batch_size: int = 10) -> None:
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            }
-        )
+        self.preview_batch_size = max(1, preview_batch_size)
+        self.headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        }
 
-    def crawl(
+    async def crawl(
         self,
         start_url: str = DEFAULT_SEARCH_URL,
         max_pages: int | None = 1,
         max_listings: int | None = None,
     ) -> list[CarListing]:
-        return list(
-            self.iter_listings(
-                start_url=start_url,
-                max_pages=max_pages,
-                max_listings=max_listings,
-            )
+        logger.info(
+            "Starting crawl start_url=%s max_pages=%s max_listings=%s preview_batch_size=%s",
+            start_url,
+            max_pages,
+            max_listings,
+            self.preview_batch_size,
         )
+        listings: list[CarListing] = []
+        async for listing in self.iter_listings(
+            start_url=start_url,
+            max_pages=max_pages,
+            max_listings=max_listings,
+        ):
+            listings.append(listing)
+        return listings
 
-    def iter_listings(
+    async def iter_listings(
         self,
         start_url: str = DEFAULT_SEARCH_URL,
         max_pages: int | None = 1,
         max_listings: int | None = None,
-    ):
-        seen_listing_urls: set[str] = set()
-        current_url = start_url
-        pages_fetched = 0
+    ) -> AsyncIterator[CarListing]:
         yielded = 0
+        async for preview_batch in self.iter_preview_batches(start_url=start_url, max_pages=max_pages):
+            batch = preview_batch
+            if max_listings is not None:
+                remaining = max_listings - yielded
+                if remaining <= 0:
+                    return
+                batch = batch[:remaining]
 
-        while current_url and (max_pages is None or pages_fetched < max_pages):
-            html = self._fetch_html(current_url)
-            previews, next_url = self.parse_result_page(html, base_url=current_url)
-            pages_fetched += 1
-
-            for preview in previews:
-                if preview.url in seen_listing_urls:
-                    continue
-                seen_listing_urls.add(preview.url)
-                yield self.fetch_listing(preview.url, preview=preview)
+            for preview, listing, error in await self.fetch_listings_with_status(batch):
+                if error is not None:
+                    raise error
+                if listing is None:
+                    raise ParserFetchError(f"Listing fetch returned no result for {preview.url}")
                 yielded += 1
+                logger.info("Yielded listing count=%s listing_id=%s", yielded, listing.listing_id)
+                yield listing
+
                 if max_listings is not None and yielded >= max_listings:
                     return
 
-            current_url = next_url
-
-    def iter_previews(
+    async def iter_previews(
         self,
         start_url: str = DEFAULT_SEARCH_URL,
         max_pages: int | None = 1,
-    ):
-        seen_listing_urls: set[str] = set()
-        current_url = start_url
-        pages_fetched = 0
-
-        while current_url and (max_pages is None or pages_fetched < max_pages):
-            html = self._fetch_html(current_url)
-            previews, next_url = self.parse_result_page(html, base_url=current_url)
-            pages_fetched += 1
-
-            for preview in previews:
-                if preview.url in seen_listing_urls:
-                    continue
-                seen_listing_urls.add(preview.url)
+    ) -> AsyncIterator[ListingPreview]:
+        async for batch in self.iter_preview_batches(start_url=start_url, max_pages=max_pages):
+            for preview in batch:
                 yield preview
 
-            current_url = next_url
+    async def iter_preview_page_batches(
+        self,
+        start_url: str = DEFAULT_SEARCH_URL,
+        max_pages: int | None = 1,
+    ) -> AsyncIterator[list[PreviewPageResult]]:
+        start_page = self._extract_result_page_number(start_url)
+        pages_remaining = max_pages
+        next_page = start_page
 
-    def fetch_listing(self, url: str, preview: ListingPreview | None = None) -> CarListing:
-        html = self._fetch_html(url)
-        return self.parse_detail_page(html, url=url, preview=preview)
+        async with self._session() as session:
+            while pages_remaining is None or pages_remaining > 0:
+                batch_size = self.preview_batch_size if pages_remaining is None else min(
+                    self.preview_batch_size, pages_remaining)
+                page_numbers = list(range(next_page, next_page + batch_size))
+                logger.info("Fetching preview batch page_numbers=%s", page_numbers)
+                batch_results = await self._fetch_preview_batch(session, page_numbers)
+
+                yielded_results: list[PreviewPageResult] = []
+                for page_result in batch_results:
+                    current_page_count = len(page_result.previews)
+                    logger.info(
+                        "Parsed preview page page_number=%s previews=%s error=%s",
+                        page_result.page_number,
+                        current_page_count,
+                        page_result.error,
+                    )
+                    yielded_results.append(page_result)
+
+                if not any(page_result.previews for page_result in yielded_results):
+                    logger.info(
+                        "Stopping preview collection because batch returned no previews page_numbers=%s",
+                        page_numbers,
+                    )
+                    break
+
+                yield yielded_results
+
+                next_page += batch_size
+                if pages_remaining is not None:
+                    pages_remaining -= batch_size
+
+    async def iter_preview_batches(
+        self,
+        start_url: str = DEFAULT_SEARCH_URL,
+        max_pages: int | None = 1,
+    ) -> AsyncIterator[list[ListingPreview]]:
+        seen_listing_urls: set[str] = set()
+        async for page_results in self.iter_preview_page_batches(start_url=start_url, max_pages=max_pages):
+            collected_batch: list[ListingPreview] = []
+            for page_result in page_results:
+                for preview in page_result.previews:
+                    if preview.url in seen_listing_urls:
+                        logger.debug("Skipping duplicate preview url=%s", preview.url)
+                        continue
+                    seen_listing_urls.add(preview.url)
+                    collected_batch.append(preview)
+
+            logger.info("Collected preview batch unique_count=%s", len(collected_batch))
+            if not collected_batch:
+                continue
+            yield collected_batch
+
+    async def collect_previews(
+        self,
+        start_url: str = DEFAULT_SEARCH_URL,
+        max_pages: int | None = 1,
+    ) -> list[ListingPreview]:
+        collected: list[ListingPreview] = []
+        async for batch in self.iter_preview_batches(start_url=start_url, max_pages=max_pages):
+            collected.extend(batch)
+        logger.info("Collected previews total=%s", len(collected))
+        return collected
+
+    async def fetch_listing(self, url: str, preview: ListingPreview | None = None) -> CarListing:
+        async with self._session() as session:
+            return await self._fetch_listing_async(session, url, preview=preview)
+
+    async def fetch_listings(self, previews: list[ListingPreview]) -> list[CarListing]:
+        results = await self.fetch_listings_with_status(previews)
+        listings: list[CarListing] = []
+        for preview, listing, error in results:
+            if error is not None:
+                raise error
+            if listing is None:
+                raise ParserFetchError(f"Listing fetch returned no result for {preview.url}")
+            listings.append(listing)
+        return listings
+
+    async def fetch_listings_with_status(
+        self,
+        previews: list[ListingPreview],
+    ) -> list[tuple[ListingPreview, CarListing | None, Exception | None]]:
+        async with self._session() as session:
+            async def worker(preview: ListingPreview) -> tuple[ListingPreview, CarListing | None, Exception | None]:
+                try:
+                    listing = await self._fetch_listing_async(session, preview.url, preview=preview)
+                    return (preview, listing, None)
+                except Exception as exc:
+                    return (preview, None, exc)
+
+            return await asyncio.gather(*(worker(preview) for preview in previews))
+
+    async def fetch_preview_pages(self, page_numbers: list[int]) -> list[PreviewPageResult]:
+        async with self._session() as session:
+            return await self._fetch_preview_batch(session, page_numbers)
+
+    async def _fetch_preview_batch(
+        self,
+        session: aiohttp.ClientSession,
+        page_numbers: list[int],
+    ) -> list[PreviewPageResult]:
+        async def worker(page_number: int) -> PreviewPageResult:
+            url = self._build_result_page_url(page_number)
+            logger.info("Fetching result page page_number=%s url=%s", page_number, url)
+            try:
+                html = await self._fetch_html_async(session, url)
+            except ParserFetchError:
+                logger.warning("Failed to fetch preview page page_number=%s url=%s", page_number, url, exc_info=True)
+                return PreviewPageResult(
+                    page_number=page_number,
+                    url=url,
+                    error=f"Failed to fetch {url}",
+                )
+
+            previews = self.parse_result_page(html, base_url=url)
+            return PreviewPageResult(page_number=page_number, url=url, previews=previews)
+
+        results = await asyncio.gather(*(worker(page_number) for page_number in page_numbers))
+        return sorted(results, key=lambda item: item.page_number)
+
+    async def _fetch_listing_async(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        preview: ListingPreview | None = None,
+    ) -> CarListing:
+        logger.info(
+            "Fetching listing detail url=%s listing_id=%s",
+            url,
+            preview.listing_id if preview else None,
+        )
+        html = await self._fetch_html_async(session, url)
+        listing = self.parse_detail_page(html, url=url, preview=preview)
+        logger.info("Parsed listing detail listing_id=%s url=%s", listing.listing_id, url)
+        return listing
 
     def extract_listing_id(self, url: str) -> str | None:
         return self._extract_listing_id(url)
 
-    def parse_result_page(self, html: str, base_url: str = BASE_URL) -> tuple[list[ListingPreview], str | None]:
+    def build_result_page_url(self, page_number: int) -> str:
+        return self._build_result_page_url(page_number)
+
+    def parse_result_page(self, html: str, base_url: str = BASE_URL) -> list[ListingPreview]:
         soup = BeautifulSoup(html, "html.parser")
         previews: list[ListingPreview] = []
         seen_urls: set[str] = set()
@@ -209,13 +300,20 @@ class CarSensorParser:
                     listing_id=self._extract_listing_id(url),
                     url=url,
                     title=self._clean_value(self._attr_or_none(image, "alt")),
-                    image_url=self._normalize_image_url(self._attr_or_none(image, "data-original") or self._attr_or_none(image, "src")),
+                    image_url=self._normalize_image_url(
+                        self._attr_or_none(image, "data-original") or self._attr_or_none(image, "src")
+                    ),
                     shop_name=self._text_or_none(shop_link),
                     shop_url=urljoin(base_url, shop_link.get("href", "")) if isinstance(shop_link, Tag) else None,
                 )
             )
 
-        return previews, self._extract_next_page_url(soup, base_url)
+        logger.info(
+            "Extracted previews from result page base_url=%s count=%s",
+            base_url,
+            len(previews),
+        )
+        return previews
 
     def parse_detail_page(self, html: str, url: str, preview: ListingPreview | None = None) -> CarListing:
         soup = BeautifulSoup(html, "html.parser")
@@ -229,19 +327,22 @@ class CarSensorParser:
         photo_urls = self._extract_photo_urls(soup, product)
         shop_name, shop_url = self._extract_shop(product, preview)
 
-        listing = CarListing(
+        return CarListing(
             listing_id=listing_id,
             make=title_parts["make"] or self._preview_or_none(preview, "make") or self._extract_brand(product, 0),
             model=title_parts["model"] or self._extract_brand(product, 1),
             trim=title_parts["trim"],
             title=title_text or self._preview_or_none(preview, "title") or self._json_get(product, "name"),
-            year=self._parse_year(self._lookup_detail_value(table_values, "year")) or self._preview_or_none(preview, "year"),
-            mileage_km=self._parse_mileage_km(self._lookup_detail_value(table_values, "mileage")) or self._preview_or_none(preview, "mileage_km"),
+            year=self._parse_year(self._lookup_detail_value(table_values, "year")
+                                  ) or self._preview_or_none(preview, "year"),
+            mileage_km=self._parse_mileage_km(self._lookup_detail_value(table_values, "mileage"))
+            or self._preview_or_none(preview, "mileage_km"),
             base_price_yen=base_price_yen,
             total_price_yen=total_price_yen,
             url=url,
             location=self._extract_location(soup, product),
-            color=self._clean_value(self._lookup_detail_value(table_values, "color")) or self._json_get(product, "color"),
+            color=self._clean_value(self._lookup_detail_value(table_values, "color")
+                                    ) or self._json_get(product, "color"),
             body_type=self._clean_value(self._lookup_detail_value(table_values, "body_type")),
             fuel_type=self._clean_value(self._lookup_detail_value(table_values, "fuel_type")),
             transmission=self._clean_value(self._lookup_detail_value(table_values, "transmission")),
@@ -262,29 +363,51 @@ class CarSensorParser:
             },
         )
 
-        return listing
+    async def _fetch_html_async(self, session: aiohttp.ClientSession, url: str) -> str:
+        logger.info("Requesting url=%s", url)
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                raw_body = await response.read()
+                final_url = str(response.url)
+                if "carsensor.net" in final_url:
+                    text = raw_body.decode("utf-8", errors="replace")
+                else:
+                    charset = response.charset or "utf-8"
+                    text = raw_body.decode(charset, errors="replace")
+                logger.info(
+                    "Received response url=%s status_code=%s final_url=%s",
+                    url,
+                    response.status,
+                    final_url,
+                )
+                return text
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise ParserFetchError(f"Failed to fetch {url}") from exc
 
-    def _fetch_html(self, url: str) -> str:
-        response = self.session.get(url, timeout=self.timeout)
-        response.raise_for_status()
-        if "carsensor.net" in response.url:
-            response.encoding = "utf-8"
-        else:
-            response.encoding = response.encoding or response.apparent_encoding or "utf-8"
-        return response.text
+    def _session(self) -> aiohttp.ClientSession:
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        return aiohttp.ClientSession(
+            headers=self.headers,
+            timeout=timeout,
+            connector=aiohttp.TCPConnector(limit=0),
+        )
 
-    def _extract_next_page_url(self, soup: BeautifulSoup, base_url: str) -> str | None:
-        candidates = soup.select("a[rel='next'], a.pager__next, a.next, a[aria-label='次へ']")
-        for candidate in candidates:
-            href = candidate.get("href")
-            if href:
-                return urljoin(base_url, href)
+    def _extract_result_page_number(self, url: str) -> int:
+        lowered_url = url.lower()
+        if "/usedcar/index.html" in lowered_url:
+            return 1
 
-        for candidate in soup.select("a[href]"):
-            href = candidate.get("href", "")
-            if "/usedcar/" in href and ("page=" in href.lower() or "pg=" in href.lower()):
-                return urljoin(base_url, href)
-        return None
+        match = RESULT_PAGE_RE.search(url)
+        if match:
+            return int(match.group(1))
+
+        return 0
+
+    def _build_result_page_url(self, page_number: int) -> str:
+        if page_number <= 1:
+            return DEFAULT_SEARCH_URL
+        return f"{BASE_URL}/usedcar/index{page_number}.html"
 
     def _extract_table_values(self, soup: BeautifulSoup) -> dict[str, str]:
         values: dict[str, str] = {}
@@ -357,7 +480,9 @@ class CarSensorParser:
         total_price = self._parse_price_to_yen(self._text_or_none(soup.select_one(".totalPrice__price")))
 
         if base_price is None:
-            base_price = self._preview_or_none(preview, "base_price_yen") or self._parse_int(self._json_get_nested(product, ["offers", 0, "price"]))
+            base_price = self._preview_or_none(preview, "base_price_yen") or self._parse_int(
+                self._json_get_nested(product, ["offers", 0, "price"])
+            )
         if total_price is None:
             total_price = self._preview_or_none(preview, "total_price_yen")
 
@@ -541,8 +666,7 @@ class CarSensorParser:
         return None
 
     def _json_get(self, payload: dict[str, Any], key: str) -> Any:
-        value = payload.get(key)
-        return value
+        return payload.get(key)
 
     def _json_get_nested(self, payload: Any, path: list[Any]) -> Any:
         current = payload
@@ -599,65 +723,3 @@ def _translate_text(text: str, lang: str) -> str:
         )
 
     return GoogleTranslator(source="ja", target=lang).translate(text)
-
-
-def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Live Carsensor parser CLI.")
-    parser.add_argument(
-        "--url",
-        default=DEFAULT_SEARCH_URL,
-        help="Result page URL to crawl or detail page URL to parse.",
-    )
-    parser.add_argument(
-        "--pages",
-        type=int,
-        default=1,
-        help="How many result pages to crawl.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=1,
-        help="Maximum number of listings to return.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="HTTP timeout in seconds.",
-    )
-    parser.add_argument(
-        "--output",
-        help="Optional path to write JSON output.",
-    )
-    parser.add_argument(
-        "--lang",
-        choices=SUPPORTED_LANGS,
-        default="ja",
-        help="Translate string field content to the target language at output time.",
-    )
-    return parser
-
-
-def main() -> None:
-    args = build_cli_parser().parse_args()
-    carsensor = CarSensorParser(timeout=args.timeout)
-
-    if DETAIL_ID_RE.search(args.url):
-        listings = [carsensor.fetch_listing(args.url)]
-    else:
-        listings = carsensor.crawl(
-            start_url=args.url,
-            max_pages=args.pages,
-            max_listings=args.limit,
-        )
-
-    payload = [listing.to_localized_dict(lang=args.lang) for listing in listings]
-    rendered = json.dumps(payload, ensure_ascii=False, indent=2)
-
-    if args.output:
-        Path(args.output).write_text(rendered, encoding="utf-8")
-        print(args.output)
-        return
-
-    print(rendered)

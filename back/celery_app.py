@@ -21,7 +21,11 @@ celery_app.conf.update(
         "carsensor-sync-watchdog": {
             "task": "back.tasks.ensure_sync_due",
             "schedule": 60.0,
-        }
+        },
+        "carsensor-translation-watchdog": {
+            "task": "back.tasks.ensure_translation_due",
+            "schedule": 60.0,
+        },
     },
 )
 

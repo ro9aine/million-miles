@@ -1,3 +1,4 @@
-from parser.carsensor import CarListing, CarSensorParser, ListingPreview
+from parser.carsensor import CarSensorParser
+from parser.models import CarListing, ListingPreview, PreviewPageResult
 
-__all__ = ["CarListing", "CarSensorParser", "ListingPreview"]
+__all__ = ["CarListing", "CarSensorParser", "ListingPreview", "PreviewPageResult"]

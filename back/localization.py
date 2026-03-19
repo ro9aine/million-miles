@@ -81,8 +81,7 @@ def slugify_text(text: str | None) -> str | None:
     if not text:
         return None
 
-    base = translate_text(text, "en") or text
-    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    slug = re.sub(r"[\W_]+", "-", text.casefold(), flags=re.UNICODE).strip("-")
     return slug or None
 
 
@@ -109,3 +108,26 @@ def localize_listing_payload(payload: dict[str, Any], lang: str) -> dict[str, An
         else:
             localized[key] = value
     return localized
+
+
+def build_localized_listing_columns(
+    payload_ja: dict[str, Any],
+    langs: tuple[str, ...] = ("en", "ru"),
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+
+    for lang in langs:
+        payload = localize_listing_payload(payload_ja, lang)
+        updates[f"payload_{lang}"] = payload
+        updates[f"title_{lang}"] = payload.get("title")
+        updates[f"make_{lang}"] = payload.get("make")
+        updates[f"model_{lang}"] = payload.get("model")
+        updates[f"location_{lang}"] = payload.get("location")
+        updates[f"body_type_{lang}"] = payload.get("body_type")
+        updates[f"fuel_type_{lang}"] = payload.get("fuel_type")
+        updates[f"transmission_{lang}"] = payload.get("transmission")
+        updates[f"drive_type_{lang}"] = payload.get("drive_type")
+        updates[f"color_{lang}"] = payload.get("color")
+        updates[f"shop_name_{lang}"] = payload.get("shop_name")
+
+    return updates

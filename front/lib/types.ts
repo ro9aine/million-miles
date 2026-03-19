@@ -57,3 +57,8 @@ export type LoginResponse = {
   token_type: string;
   expires_in: number;
 };
+
+export type SyncResponse = {
+  queued: boolean;
+  task_id: string;
+};

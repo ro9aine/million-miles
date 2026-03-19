@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     token_expire_minutes: int = 720
     sync_interval_seconds: int = 3600
+    translation_interval_seconds: int = 60
+    translation_batch_size: int = 25
     sync_max_pages: int | None = None
     sync_max_listings: int | None = None
     startup_sync_enabled: bool = True

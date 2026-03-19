@@ -10,6 +10,16 @@ type ApiRequestOptions = {
   params?: Record<string, string | number | undefined | null>;
 };
 
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export async function apiRequest<T>(
   path: string,
   options: ApiRequestOptions = {},
@@ -34,7 +44,7 @@ export async function apiRequest<T>(
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    throw new ApiError(response.status, text || `HTTP ${response.status}`);
   }
 
   return (await response.json()) as T;

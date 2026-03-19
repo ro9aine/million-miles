@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { apiBaseUrl, apiRequest } from "../lib/api";
+import { ApiError, apiRequest } from "../lib/api";
 import {
   clearStoredToken,
   getStoredLanguage,
@@ -12,7 +12,7 @@ import {
   setStoredLanguage,
 } from "../lib/auth";
 import { formatNumber, formatYen } from "../lib/format";
-import type { CarListResponse, Lang } from "../lib/types";
+import type { CarListResponse, Lang, SyncResponse } from "../lib/types";
 
 
 type FiltersState = {
@@ -33,6 +33,14 @@ type FiltersState = {
   sort_order: "asc" | "desc";
 };
 
+type RangeFilterKey =
+  | "min_year"
+  | "max_year"
+  | "min_price"
+  | "max_price"
+  | "min_mileage"
+  | "max_mileage";
+
 const defaultFilters: FiltersState = {
   query: "",
   make: "",
@@ -51,6 +59,72 @@ const defaultFilters: FiltersState = {
   sort_order: "desc",
 };
 
+const YEAR_MIN = 1900;
+const YEAR_MAX = 2100;
+const NON_NEGATIVE_MIN = 0;
+const YEAR_STEP = 1;
+const PRICE_STEP = 10000;
+const MILEAGE_STEP = 1000;
+
+function clampNumber(value: number, min: number, max?: number): number {
+  const upperBound = max ?? Number.POSITIVE_INFINITY;
+  return Math.min(Math.max(value, min), upperBound);
+}
+
+function normalizeNumericString(value: string, min: number, max?: number): string {
+  if (value === "") {
+    return "";
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return "";
+  }
+
+  return String(clampNumber(Math.trunc(parsed), min, max));
+}
+
+function normalizeFilters(filters: FiltersState): FiltersState {
+  const normalized: FiltersState = {
+    ...filters,
+    min_year: normalizeNumericString(filters.min_year, YEAR_MIN, YEAR_MAX),
+    max_year: normalizeNumericString(filters.max_year, YEAR_MIN, YEAR_MAX),
+    min_price: normalizeNumericString(filters.min_price, NON_NEGATIVE_MIN),
+    max_price: normalizeNumericString(filters.max_price, NON_NEGATIVE_MIN),
+    min_mileage: normalizeNumericString(filters.min_mileage, NON_NEGATIVE_MIN),
+    max_mileage: normalizeNumericString(filters.max_mileage, NON_NEGATIVE_MIN),
+  };
+
+  const rangePairs: Array<[RangeFilterKey, RangeFilterKey]> = [
+    ["min_year", "max_year"],
+    ["min_price", "max_price"],
+    ["min_mileage", "max_mileage"],
+  ];
+
+  for (const [minKey, maxKey] of rangePairs) {
+    const minValue = normalized[minKey];
+    const maxValue = normalized[maxKey];
+    if (minValue === "" || maxValue === "") {
+      continue;
+    }
+    if (Number(minValue) > Number(maxValue)) {
+      normalized[maxKey] = minValue;
+    }
+  }
+
+  return normalized;
+}
+
+function getRequestErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 422) {
+      return "One or more filters are outside the API limits.";
+    }
+    return `Request failed (${error.status}).`;
+  }
+  return "Could not load inventory. Check API availability.";
+}
+
 
 export function InventoryPage() {
   const router = useRouter();
@@ -61,6 +135,8 @@ export function InventoryPage() {
   const [data, setData] = useState<CarListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
+  const [syncPending, setSyncPending] = useState(false);
   const [filtersOpen, setFiltersOpen] = useState(false);
 
   useEffect(() => {
@@ -88,7 +164,7 @@ export function InventoryPage() {
         lang,
         page,
         page_size: 12,
-        ...filters,
+        ...normalizeFilters(filters),
       },
     })
       .then((payload) => {
@@ -96,11 +172,15 @@ export function InventoryPage() {
           setData(payload);
         }
       })
-      .catch(() => {
+      .catch((requestError: unknown) => {
         if (!cancelled) {
-          clearStoredToken();
-          setError("Session expired or API unavailable.");
-          router.replace("/login");
+          if (requestError instanceof ApiError && requestError.status === 401) {
+            clearStoredToken();
+            setError("Session expired.");
+            router.replace("/login");
+            return;
+          }
+          setError(getRequestErrorMessage(requestError));
         }
       })
       .finally(() => {
@@ -136,12 +216,42 @@ export function InventoryPage() {
 
   function updateFilter(key: keyof FiltersState, value: string) {
     setPage(1);
-    setFilters((current) => ({ ...current, [key]: value }));
+    setFilters((current) => normalizeFilters({ ...current, [key]: value }));
   }
 
   function handleLanguageChange(value: Lang) {
     setStoredLanguage(value);
     setLang(value);
+  }
+
+  async function handleForceSync() {
+    if (!token || syncPending) {
+      return;
+    }
+
+    setSyncPending(true);
+    setSyncMessage(null);
+    setError(null);
+
+    try {
+      const response = await apiRequest<SyncResponse>("/sync", {
+        token,
+        method: "POST",
+      });
+      setSyncMessage(response.queued ? `Sync queued: ${response.task_id}` : "Sync request was not queued.");
+      setPage(1);
+    } catch (requestError: unknown) {
+      if (requestError instanceof ApiError && requestError.status === 401) {
+        clearStoredToken();
+        setError("Session expired.");
+        router.replace("/login");
+        return;
+      }
+      setSyncMessage(null);
+      setError(getRequestErrorMessage(requestError));
+    } finally {
+      setSyncPending(false);
+    }
   }
 
   function renderFilterControls() {
@@ -213,12 +323,12 @@ export function InventoryPage() {
           <option value="asc">Asc</option>
         </select>
 
-        <input className="control" type="number" placeholder="Min year" value={filters.min_year} onChange={(event) => updateFilter("min_year", event.target.value)} />
-        <input className="control" type="number" placeholder="Max year" value={filters.max_year} onChange={(event) => updateFilter("max_year", event.target.value)} />
-        <input className="control" type="number" placeholder="Min price" value={filters.min_price} onChange={(event) => updateFilter("min_price", event.target.value)} />
-        <input className="control" type="number" placeholder="Max price" value={filters.max_price} onChange={(event) => updateFilter("max_price", event.target.value)} />
-        <input className="control" type="number" placeholder="Min mileage" value={filters.min_mileage} onChange={(event) => updateFilter("min_mileage", event.target.value)} />
-        <input className="control" type="number" placeholder="Max mileage" value={filters.max_mileage} onChange={(event) => updateFilter("max_mileage", event.target.value)} />
+        <input className="control" type="number" min={YEAR_MIN} max={YEAR_MAX} step={YEAR_STEP} placeholder="Min year" value={filters.min_year} onChange={(event) => updateFilter("min_year", event.target.value)} />
+        <input className="control" type="number" min={YEAR_MIN} max={YEAR_MAX} step={YEAR_STEP} placeholder="Max year" value={filters.max_year} onChange={(event) => updateFilter("max_year", event.target.value)} />
+        <input className="control" type="number" min={NON_NEGATIVE_MIN} step={PRICE_STEP} placeholder="Min price" value={filters.min_price} onChange={(event) => updateFilter("min_price", event.target.value)} />
+        <input className="control" type="number" min={NON_NEGATIVE_MIN} step={PRICE_STEP} placeholder="Max price" value={filters.max_price} onChange={(event) => updateFilter("max_price", event.target.value)} />
+        <input className="control" type="number" min={NON_NEGATIVE_MIN} step={MILEAGE_STEP} placeholder="Min mileage" value={filters.min_mileage} onChange={(event) => updateFilter("min_mileage", event.target.value)} />
+        <input className="control" type="number" min={NON_NEGATIVE_MIN} step={MILEAGE_STEP} placeholder="Max mileage" value={filters.max_mileage} onChange={(event) => updateFilter("max_mileage", event.target.value)} />
       </div>
     );
   }
@@ -229,10 +339,12 @@ export function InventoryPage() {
         <div>
           <p className="eyebrow">Million Miles</p>
           <h1>Carsensor stock</h1>
-          <p className="status-copy">API: <code>{apiBaseUrl}</code></p>
         </div>
 
         <div className="topbar-actions">
+          <button className="primary-button" type="button" onClick={handleForceSync} disabled={!token || syncPending}>
+            {syncPending ? "Queueing..." : "Force sync"}
+          </button>
           <select
             className="control"
             value={lang}
@@ -276,6 +388,7 @@ export function InventoryPage() {
         <div>
           <strong>{data?.total ?? 0}</strong> cars in storage
         </div>
+        {syncMessage ? <p>{syncMessage}</p> : null}
         {error ? <p className="form-error">{error}</p> : null}
       </section>
 

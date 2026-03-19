@@ -24,6 +24,8 @@ class SyncResponse(BaseModel):
 class SyncMetaResponse(BaseModel):
     count: int
     last_synced_at: str | None
+    failed_result_pages: int = 0
+    failed_detail_pages: int = 0
 
 
 class FilterOption(BaseModel):
