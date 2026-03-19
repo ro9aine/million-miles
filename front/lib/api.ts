@@ -11,6 +11,32 @@ type ApiRequestOptions = {
   params?: Record<string, string | number | undefined | null>;
 };
 
+function sanitizeParams(
+  params?: Record<string, string | number | undefined | null>,
+): Record<string, string | number> | undefined {
+  if (!params) {
+    return undefined;
+  }
+
+  const sanitized: Record<string, string | number> = {};
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (typeof value === "string" && value.trim() === "") {
+      continue;
+    }
+    sanitized[key] = value;
+  }
+
+  if (!Object.keys(sanitized).length) {
+    return undefined;
+  }
+
+  return sanitized;
+}
+
 export class ApiError extends Error {
   status: number;
 
@@ -30,7 +56,7 @@ export async function apiRequest<T>(
       url: `${apiBaseUrl}${path}`,
       method: options.method ?? "GET",
       data: options.body,
-      params: options.params,
+      params: sanitizeParams(options.params),
       withCredentials: true,
       headers: {
         "Content-Type": "application/json",
