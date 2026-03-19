@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from back.auth import create_access_token, require_auth, verify_password
@@ -14,6 +14,7 @@ from back.schemas import (
     CarDetailResponse,
     CarListResponse,
     LoginRequest,
+    SessionResponse,
     SortBy,
     SortOrder,
     SyncMetaResponse,
@@ -46,13 +47,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health", tags=["system"])
 async def healthcheck() -> dict[str, str | int | None]:
     meta = database.get_sync_meta()
     return {"status": "ok", **meta}
 
+
 @app.post("/auth/login", response_model=TokenResponse, tags=["auth"])
-async def login(payload: LoginRequest) -> TokenResponse:
+async def login(payload: LoginRequest, response: Response) -> TokenResponse:
     user = database.get_user(payload.username)
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(
@@ -61,14 +64,39 @@ async def login(payload: LoginRequest) -> TokenResponse:
         )
 
     token = create_access_token(payload.username)
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=token,
+        max_age=settings.token_expire_minutes * 60,
+        httponly=True,
+        secure=settings.auth_cookie_secure,
+        samesite=settings.auth_cookie_samesite,
+        path="/",
+    )
     return TokenResponse(
-        access_token=token,
         expires_in=settings.token_expire_minutes * 60,
     )
 
-@app.get("/cars", response_model=CarListResponse, tags=["cars"])
+
+@app.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT, tags=["auth"])
+async def logout(response: Response) -> Response:
+    response.delete_cookie(
+        key=settings.auth_cookie_name,
+        httponly=True,
+        secure=settings.auth_cookie_secure,
+        samesite=settings.auth_cookie_samesite,
+        path="/",
+    )
+    return response
+
+
+@app.get("/auth/session", response_model=SessionResponse, tags=["auth"])
+async def auth_session(username: str = Depends(require_auth)) -> SessionResponse:
+    return SessionResponse(authenticated=True, username=username)
+
+
+@app.get("/cars", response_model=CarListResponse, tags=["cars"], dependencies=[Depends(require_auth)])
 async def list_cars(
-    _: str = Depends(require_auth),
     lang: str = Query("en", pattern="^(ja|en|ru)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(12, ge=1, le=50),
@@ -114,10 +142,10 @@ async def list_cars(
     )
     return CarListResponse.model_validate(payload)
 
-@app.get("/cars/{listing_id}", response_model=CarDetailResponse, tags=["cars"])
+
+@app.get("/cars/{listing_id}", response_model=CarDetailResponse, tags=["cars"], dependencies=[Depends(require_auth)])
 async def get_car(
     listing_id: str,
-    _: str = Depends(require_auth),
     lang: str = Query("en", pattern="^(ja|en|ru)$"),
 ) -> CarDetailResponse:
     item = database.get_car(listing_id, lang)
@@ -125,11 +153,13 @@ async def get_car(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Car not found.")
     return CarDetailResponse(item=item)
 
-@app.post("/sync", response_model=SyncResponse, tags=["system"])
-async def sync_now(_: str = Depends(require_auth)) -> SyncResponse:
+
+@app.post("/sync", response_model=SyncResponse, tags=["system"], dependencies=[Depends(require_auth)])
+async def sync_now() -> SyncResponse:
     task = celery_app.send_task("back.tasks.sync_cars_now")
     return SyncResponse(queued=True, task_id=task.id)
 
-@app.get("/sync/meta", response_model=SyncMetaResponse, tags=["system"])
-async def sync_meta(_: str = Depends(require_auth)) -> SyncMetaResponse:
+
+@app.get("/sync/meta", response_model=SyncMetaResponse, tags=["system"], dependencies=[Depends(require_auth)])
+async def sync_meta() -> SyncMetaResponse:
     return SyncMetaResponse.model_validate(database.get_sync_meta())

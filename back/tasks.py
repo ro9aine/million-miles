@@ -20,6 +20,26 @@ TRANSLATION_JOB_NAME = "carsensor-translation"
 logger = logging.getLogger(__name__)
 
 
+def _translate_sources(sources: list[dict[str, object]]) -> int:
+    translated = 0
+    for source in sources:
+        missing_langs = tuple(source.get("missing_langs", []))
+        if not missing_langs:
+            continue
+
+        localized = build_localized_listing_columns(
+            source["payload_ja"],
+            langs=missing_langs,
+        )
+        updates = {
+            key: json.dumps(value, ensure_ascii=False) if key.startswith("payload_") else value
+            for key, value in localized.items()
+        }
+        database.update_car_localizations(source["listing_id"], updates)
+        translated += 1
+    return translated
+
+
 def _run_sync(*, force: bool) -> dict[str, str | int | bool]:
     initialize_runtime(database)
     logger.info(
@@ -93,20 +113,9 @@ def ensure_translation_due() -> dict[str, int | bool]:
         return {"started": False, "translated": 0, "missing": 0}
 
     succeeded = False
-    translated = 0
     pending = database.get_cars_missing_localization(settings.translation_batch_size)
     try:
-        for source in pending:
-            localized = build_localized_listing_columns(
-                source["payload_ja"],
-                langs=tuple(source["missing_langs"]),
-            )
-            updates = {
-                key: json.dumps(value, ensure_ascii=False) if key.startswith("payload_") else value
-                for key, value in localized.items()
-            }
-            database.update_car_localizations(source["listing_id"], updates)
-            translated += 1
+        translated = _translate_sources(pending)
 
         succeeded = True
         result = {
@@ -118,3 +127,23 @@ def ensure_translation_due() -> dict[str, int | bool]:
         return result
     finally:
         database.finish_job(TRANSLATION_JOB_NAME, succeeded=succeeded)
+
+
+@celery_app.task(name="back.tasks.translate_cars_batch")
+def translate_cars_batch(listing_ids: list[str] | None = None) -> dict[str, int | bool]:
+    initialize_runtime(database)
+    listing_ids = listing_ids or []
+    logger.info("Received compatibility translation task listing_count=%s", len(listing_ids))
+
+    if not listing_ids:
+        return {"started": False, "translated": 0, "missing": 0}
+
+    sources = database.get_cars_by_listing_ids(listing_ids)
+    translated = _translate_sources(sources)
+    result = {
+        "started": True,
+        "translated": translated,
+        "missing": max(0, len(listing_ids) - translated),
+    }
+    logger.info("Completed compatibility translation task result=%s", result)
+    return result

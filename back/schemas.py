@@ -11,9 +11,13 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+    authenticated: bool = True
     expires_in: int
+
+
+class SessionResponse(BaseModel):
+    authenticated: bool
+    username: str
 
 
 class SyncResponse(BaseModel):

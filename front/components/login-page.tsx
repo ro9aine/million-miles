@@ -4,8 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { apiRequest } from "../lib/api";
-import { setStoredToken, getStoredToken } from "../lib/auth";
-import type { LoginResponse } from "../lib/types";
+import type { LoginResponse, SessionResponse } from "../lib/types";
 
 
 export function LoginPage() {
@@ -16,9 +15,21 @@ export function LoginPage() {
   const [pending, setPending] = useState(false);
 
   useEffect(() => {
-    if (getStoredToken()) {
-      router.replace("/inventory");
-    }
+    let cancelled = false;
+
+    apiRequest<SessionResponse>("/auth/session")
+      .then(() => {
+        if (!cancelled) {
+          router.replace("/inventory");
+        }
+      })
+      .catch(() => {
+        // The user is not authenticated yet.
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [router]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -27,11 +38,10 @@ export function LoginPage() {
     setError(null);
 
     try {
-      const response = await apiRequest<LoginResponse>("/auth/login", {
+      await apiRequest<LoginResponse>("/auth/login", {
         method: "POST",
         body: { username, password },
       });
-      setStoredToken(response.access_token);
       router.replace("/inventory");
     } catch (requestError) {
       setError("Login failed. Use admin / admin123.");
@@ -46,7 +56,7 @@ export function LoginPage() {
         <p className="eyebrow">Million Miles</p>
         <h1>Dealer dashboard</h1>
         <p className="lead">
-          JWT login for the imported Carsensor inventory. Default credentials are
+          Secure cookie login for the imported Carsensor inventory. Default credentials are
           {" "}
           <strong>admin / admin123</strong>.
         </p>

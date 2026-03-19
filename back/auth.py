@@ -6,7 +6,7 @@ import json
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from back.config import settings
@@ -60,15 +60,20 @@ def decode_access_token(token: str) -> dict:
 
 
 def require_auth(
+    token_cookie: str | None = Cookie(default=None, alias=settings.auth_cookie_name),
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> str:
-    if credentials is None:
+    token = token_cookie
+    if not token and credentials is not None:
+        token = credentials.credentials
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing bearer token.",
+            detail="Missing authentication token.",
         )
 
-    payload = decode_access_token(credentials.credentials)
+    payload = decode_access_token(token)
     username = payload.get("sub")
     if not isinstance(username, str) or not username:
         raise HTTPException(

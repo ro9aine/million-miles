@@ -5,12 +5,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { ApiError, apiRequest } from "../lib/api";
-import {
-  clearStoredToken,
-  getStoredLanguage,
-  getStoredToken,
-  setStoredLanguage,
-} from "../lib/auth";
+import { getStoredLanguage, setStoredLanguage } from "../lib/auth";
 import { formatNumber, formatYen } from "../lib/format";
 import type { CarListResponse, Lang, SyncResponse } from "../lib/types";
 
@@ -128,7 +123,6 @@ function getRequestErrorMessage(error: unknown): string {
 
 export function InventoryPage() {
   const router = useRouter();
-  const [token, setToken] = useState<string | null>(null);
   const [lang, setLang] = useState<Lang>("en");
   const [filters, setFilters] = useState<FiltersState>(defaultFilters);
   const [page, setPage] = useState(1);
@@ -140,26 +134,15 @@ export function InventoryPage() {
   const [filtersOpen, setFiltersOpen] = useState(false);
 
   useEffect(() => {
-    const storedToken = getStoredToken();
-    if (!storedToken) {
-      router.replace("/login");
-      return;
-    }
-    setToken(storedToken);
     setLang(getStoredLanguage());
   }, [router]);
 
   useEffect(() => {
-    if (!token) {
-      return;
-    }
-
     let cancelled = false;
     setLoading(true);
     setError(null);
 
     apiRequest<CarListResponse>("/cars", {
-      token,
       params: {
         lang,
         page,
@@ -175,7 +158,6 @@ export function InventoryPage() {
       .catch((requestError: unknown) => {
         if (!cancelled) {
           if (requestError instanceof ApiError && requestError.status === 401) {
-            clearStoredToken();
             setError("Session expired.");
             router.replace("/login");
             return;
@@ -192,7 +174,7 @@ export function InventoryPage() {
     return () => {
       cancelled = true;
     };
-  }, [filters, lang, page, router, token]);
+  }, [filters, lang, page, router]);
 
   useEffect(() => {
     if (!filtersOpen) {
@@ -209,8 +191,12 @@ export function InventoryPage() {
     return () => window.removeEventListener("keydown", handleEscape);
   }, [filtersOpen]);
 
-  function handleLogout() {
-    clearStoredToken();
+  async function handleLogout() {
+    try {
+      await apiRequest<void>("/auth/logout", { method: "POST" });
+    } catch {
+      // Redirect even if logout cleanup fails.
+    }
     router.replace("/login");
   }
 
@@ -225,7 +211,7 @@ export function InventoryPage() {
   }
 
   async function handleForceSync() {
-    if (!token || syncPending) {
+    if (syncPending) {
       return;
     }
 
@@ -235,14 +221,12 @@ export function InventoryPage() {
 
     try {
       const response = await apiRequest<SyncResponse>("/sync", {
-        token,
         method: "POST",
       });
       setSyncMessage(response.queued ? `Sync queued: ${response.task_id}` : "Sync request was not queued.");
       setPage(1);
     } catch (requestError: unknown) {
       if (requestError instanceof ApiError && requestError.status === 401) {
-        clearStoredToken();
         setError("Session expired.");
         router.replace("/login");
         return;
@@ -342,7 +326,7 @@ export function InventoryPage() {
         </div>
 
         <div className="topbar-actions">
-          <button className="primary-button" type="button" onClick={handleForceSync} disabled={!token || syncPending}>
+          <button className="primary-button" type="button" onClick={handleForceSync} disabled={syncPending}>
             {syncPending ? "Queueing..." : "Force sync"}
           </button>
           <select
@@ -354,7 +338,7 @@ export function InventoryPage() {
             <option value="ru">Русский</option>
             <option value="ja">日本語</option>
           </select>
-          <button className="ghost-button" type="button" onClick={handleLogout}>
+          <button className="ghost-button" type="button" onClick={() => void handleLogout()}>
             Logout
           </button>
         </div>

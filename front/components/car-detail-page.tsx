@@ -5,7 +5,6 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiRequest } from "../lib/api";
-import { clearStoredToken, getStoredToken } from "../lib/auth";
 import { formatNumber, formatYen } from "../lib/format";
 import type { CarDetailResponse } from "../lib/types";
 
@@ -55,16 +54,9 @@ export function CarDetailPage({ listingId }: Props) {
   const lang = searchParams.get("lang") ?? "en";
 
   useEffect(() => {
-    const token = getStoredToken();
-    if (!token) {
-      router.replace("/login");
-      return;
-    }
-
     let cancelled = false;
 
     apiRequest<CarDetailResponse>(`/cars/${listingId}`, {
-      token,
       params: { lang },
     })
       .then((payload) => {
@@ -77,7 +69,6 @@ export function CarDetailPage({ listingId }: Props) {
       .catch((requestError: unknown) => {
         if (!cancelled) {
           if (requestError instanceof ApiError && requestError.status === 401) {
-            clearStoredToken();
             setError("Session expired.");
             router.replace("/login");
             return;

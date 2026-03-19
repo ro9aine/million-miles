@@ -53,9 +53,13 @@ export type CarDetailResponse = {
 };
 
 export type LoginResponse = {
-  access_token: string;
-  token_type: string;
+  authenticated: boolean;
   expires_in: number;
+};
+
+export type SessionResponse = {
+  authenticated: boolean;
+  username: string;
 };
 
 export type SyncResponse = {

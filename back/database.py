@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Integer, String, Text, create_engine, func, inspect, or_, select, text
+from sqlalchemy import Index, Integer, String, Text, create_engine, func, inspect, or_, select, text
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -33,6 +33,22 @@ class UserRecord(Base):
 
 class CarRecord(Base):
     __tablename__ = "cars"
+    __table_args__ = (
+        Index("ix_cars_source_url", "source_url"),
+        Index("ix_cars_color_key", "color_key"),
+        Index("ix_cars_base_price_yen", "base_price_yen"),
+        Index("ix_cars_make_key", "make_key"),
+        Index("ix_cars_body_type_key", "body_type_key"),
+        Index("ix_cars_fuel_type_key", "fuel_type_key"),
+        Index("ix_cars_transmission_key", "transmission_key"),
+        Index("ix_cars_drive_type_key", "drive_type_key"),
+        Index("ix_cars_location_key", "location_key"),
+        Index("ix_cars_synced_at", "synced_at"),
+        Index("ix_cars_synced_at_listing_id", "synced_at", "listing_id"),
+        Index("ix_cars_price_listing_id", "base_price_yen", "listing_id"),
+        Index("ix_cars_year_listing_id", "year", "listing_id"),
+        Index("ix_cars_mileage_listing_id", "mileage_km", "listing_id"),
+    )
 
     listing_id: Mapped[str] = mapped_column(String, primary_key=True)
     source_url: Mapped[str] = mapped_column(String, nullable=False)
@@ -73,19 +89,19 @@ class CarRecord(Base):
     shop_name_ru: Mapped[str | None] = mapped_column(String)
     year: Mapped[int | None] = mapped_column(Integer)
     mileage_km: Mapped[int | None] = mapped_column(Integer)
-    base_price_yen: Mapped[int | None] = mapped_column(Integer, index=True)
+    base_price_yen: Mapped[int | None] = mapped_column(Integer)
     total_price_yen: Mapped[int | None] = mapped_column(Integer)
     engine_volume_cc: Mapped[int | None] = mapped_column(Integer)
     doors: Mapped[int | None] = mapped_column(Integer)
     seats: Mapped[int | None] = mapped_column(Integer)
-    make_key: Mapped[str | None] = mapped_column(String, index=True)
-    body_type_key: Mapped[str | None] = mapped_column(String, index=True)
-    fuel_type_key: Mapped[str | None] = mapped_column(String, index=True)
-    transmission_key: Mapped[str | None] = mapped_column(String, index=True)
-    drive_type_key: Mapped[str | None] = mapped_column(String, index=True)
-    location_key: Mapped[str | None] = mapped_column(String, index=True)
+    make_key: Mapped[str | None] = mapped_column(String)
+    body_type_key: Mapped[str | None] = mapped_column(String)
+    fuel_type_key: Mapped[str | None] = mapped_column(String)
+    transmission_key: Mapped[str | None] = mapped_column(String)
+    drive_type_key: Mapped[str | None] = mapped_column(String)
+    location_key: Mapped[str | None] = mapped_column(String)
     color_key: Mapped[str | None] = mapped_column(String)
-    synced_at: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    synced_at: Mapped[str] = mapped_column(String, nullable=False)
 
 
 class SyncStateRecord(Base):
@@ -100,6 +116,9 @@ class SyncStateRecord(Base):
 
 class FailedResultPageRecord(Base):
     __tablename__ = "failed_result_pages"
+    __table_args__ = (
+        Index("ix_failed_result_pages_last_failed_at", "last_failed_at"),
+    )
 
     page_number: Mapped[int] = mapped_column(Integer, primary_key=True)
     page_url: Mapped[str] = mapped_column(String, nullable=False)
@@ -111,9 +130,13 @@ class FailedResultPageRecord(Base):
 
 class FailedDetailPageRecord(Base):
     __tablename__ = "failed_detail_pages"
+    __table_args__ = (
+        Index("ix_failed_detail_pages_last_failed_at", "last_failed_at"),
+        Index("ix_failed_detail_pages_listing_id", "listing_id"),
+    )
 
     listing_url: Mapped[str] = mapped_column(String, primary_key=True)
-    listing_id: Mapped[str | None] = mapped_column(String, index=True)
+    listing_id: Mapped[str | None] = mapped_column(String)
     last_error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     first_failed_at: Mapped[str] = mapped_column(String, nullable=False)
@@ -138,6 +161,7 @@ class Database:
     def init(self) -> None:
         Base.metadata.create_all(self.engine)
         self._migrate_schema()
+        self._ensure_declared_indexes()
 
     def session(self) -> Session:
         return self.session_factory()
@@ -216,6 +240,34 @@ class Database:
                 missing_langs.append("ru")
             if not missing_langs:
                 continue
+            result.append(
+                {
+                    "listing_id": row.listing_id,
+                    "payload_ja": json.loads(row.payload_ja),
+                    "missing_langs": missing_langs,
+                }
+            )
+        return result
+
+    def get_cars_by_listing_ids(self, listing_ids: list[str]) -> list[dict[str, Any]]:
+        if not listing_ids:
+            return []
+
+        with self.session() as session:
+            rows = session.scalars(
+                select(CarRecord)
+                .where(CarRecord.listing_id.in_(listing_ids))
+                .order_by(CarRecord.listing_id.asc())
+            ).all()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            missing_langs: list[str] = []
+            if row.payload_en == row.payload_ja:
+                missing_langs.append("en")
+            if row.payload_ru == row.payload_ja:
+                missing_langs.append("ru")
+
             result.append(
                 {
                     "listing_id": row.listing_id,
@@ -477,6 +529,11 @@ class Database:
 
         with self.engine.begin() as connection:
             connection.execute(text("ALTER TABLE sync_state ADD COLUMN last_succeeded_at VARCHAR"))
+
+    def _ensure_declared_indexes(self) -> None:
+        for table in Base.metadata.sorted_tables:
+            for index in table.indexes:
+                index.create(self.engine, checkfirst=True)
 
     def _apply_filters(
         self,
