@@ -15,18 +15,38 @@ class SyncService:
         self.database = database
         self.parser = parser
 
-    def sync(self, *, max_pages: int, max_listings: int | None) -> dict[str, Any]:
+    def sync(self, *, max_pages: int | None, max_listings: int | None) -> dict[str, Any]:
         synced_at = datetime.now(timezone.utc).isoformat()
         synced = 0
+        deferred_previews = []
 
-        for listing in self.parser.iter_listings(
+        for preview in self.parser.iter_previews(
             max_pages=max_pages,
-            max_listings=max_listings,
         ):
+            listing_id = preview.listing_id or self.parser.extract_listing_id(preview.url)
+            if listing_id and self.database.has_car(listing_id):
+                deferred_previews.append(preview)
+                continue
+
+            listing = self.parser.fetch_listing(preview.url, preview=preview)
             if not listing.listing_id or not listing.url:
                 continue
             self.database.upsert_car(self._build_record(listing, synced_at))
             synced += 1
+            if max_listings is not None and synced >= max_listings:
+                return {
+                    "synced": synced,
+                    "last_synced_at": synced_at,
+                }
+
+        for preview in deferred_previews:
+            listing = self.parser.fetch_listing(preview.url, preview=preview)
+            if not listing.listing_id or not listing.url:
+                continue
+            self.database.upsert_car(self._build_record(listing, synced_at))
+            synced += 1
+            if max_listings is not None and synced >= max_listings:
+                break
 
         return {
             "synced": synced,

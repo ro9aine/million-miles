@@ -160,6 +160,15 @@ class Database:
             value = session.scalar(select(func.count()).select_from(CarRecord))
         return int(value or 0)
 
+    def has_car(self, listing_id: str) -> bool:
+        with self.session() as session:
+            value = session.scalar(
+                select(func.count())
+                .select_from(CarRecord)
+                .where(CarRecord.listing_id == listing_id)
+            )
+        return bool(value)
+
     def list_cars(
         self,
         *,

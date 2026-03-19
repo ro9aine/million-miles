@@ -3,11 +3,7 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from typing import Any
-
-try:
-    from deep_translator import GoogleTranslator
-except ImportError:  # pragma: no cover
-    GoogleTranslator = None
+from deep_translator import GoogleTranslator
 
 
 SUPPORTED_LANGS = ("ja", "en", "ru")

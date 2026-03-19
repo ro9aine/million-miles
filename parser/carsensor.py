@@ -92,6 +92,7 @@ class CarListing:
 @dataclass(slots=True)
 class ListingPreview:
     url: str
+    listing_id: str | None = None
     make: str | None = None
     title: str | None = None
     base_price_yen: int | None = None
@@ -117,7 +118,7 @@ class CarSensorParser:
     def crawl(
         self,
         start_url: str = DEFAULT_SEARCH_URL,
-        max_pages: int = 1,
+        max_pages: int | None = 1,
         max_listings: int | None = None,
     ) -> list[CarListing]:
         return list(
@@ -131,7 +132,7 @@ class CarSensorParser:
     def iter_listings(
         self,
         start_url: str = DEFAULT_SEARCH_URL,
-        max_pages: int = 1,
+        max_pages: int | None = 1,
         max_listings: int | None = None,
     ):
         seen_listing_urls: set[str] = set()
@@ -139,7 +140,7 @@ class CarSensorParser:
         pages_fetched = 0
         yielded = 0
 
-        while current_url and pages_fetched < max_pages:
+        while current_url and (max_pages is None or pages_fetched < max_pages):
             html = self._fetch_html(current_url)
             previews, next_url = self.parse_result_page(html, base_url=current_url)
             pages_fetched += 1
@@ -155,9 +156,34 @@ class CarSensorParser:
 
             current_url = next_url
 
+    def iter_previews(
+        self,
+        start_url: str = DEFAULT_SEARCH_URL,
+        max_pages: int | None = 1,
+    ):
+        seen_listing_urls: set[str] = set()
+        current_url = start_url
+        pages_fetched = 0
+
+        while current_url and (max_pages is None or pages_fetched < max_pages):
+            html = self._fetch_html(current_url)
+            previews, next_url = self.parse_result_page(html, base_url=current_url)
+            pages_fetched += 1
+
+            for preview in previews:
+                if preview.url in seen_listing_urls:
+                    continue
+                seen_listing_urls.add(preview.url)
+                yield preview
+
+            current_url = next_url
+
     def fetch_listing(self, url: str, preview: ListingPreview | None = None) -> CarListing:
         html = self._fetch_html(url)
         return self.parse_detail_page(html, url=url, preview=preview)
+
+    def extract_listing_id(self, url: str) -> str | None:
+        return self._extract_listing_id(url)
 
     def parse_result_page(self, html: str, base_url: str = BASE_URL) -> tuple[list[ListingPreview], str | None]:
         soup = BeautifulSoup(html, "html.parser")
@@ -180,6 +206,7 @@ class CarSensorParser:
 
             previews.append(
                 ListingPreview(
+                    listing_id=self._extract_listing_id(url),
                     url=url,
                     title=self._clean_value(self._attr_or_none(image, "alt")),
                     image_url=self._normalize_image_url(self._attr_or_none(image, "data-original") or self._attr_or_none(image, "src")),
