@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import Index, Integer, String, Text, func, inspect, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -152,6 +153,8 @@ class Database:
             autoflush=False,
             expire_on_commit=False,
         )
+        self._filter_cache_ttl_seconds = 60
+        self._filter_cache: dict[str, tuple[float, dict[str, list[dict[str, str]]]]] = {}
 
     async def init(self) -> None:
         async with self.engine.begin() as connection:
@@ -194,6 +197,7 @@ class Database:
         async with self.session_factory() as session:
             await session.execute(statement)
             await session.commit()
+        self._clear_filter_cache()
 
     async def count_cars(self) -> int:
         async with self.session_factory() as session:
@@ -212,8 +216,13 @@ class Database:
     async def get_cars_missing_localization(self, limit: int) -> list[dict[str, Any]]:
         async with self.session_factory() as session:
             rows = (
-                await session.scalars(
-                    select(CarRecord)
+                await session.execute(
+                    select(
+                        CarRecord.listing_id,
+                        CarRecord.payload_ja,
+                        CarRecord.payload_en,
+                        CarRecord.payload_ru,
+                    )
                     .where(
                         or_(
                             CarRecord.payload_en == CarRecord.payload_ja,
@@ -226,18 +235,18 @@ class Database:
             ).all()
 
         result: list[dict[str, Any]] = []
-        for row in rows:
+        for listing_id, payload_ja, payload_en, payload_ru in rows:
             missing_langs: list[str] = []
-            if row.payload_en == row.payload_ja:
+            if payload_en == payload_ja:
                 missing_langs.append("en")
-            if row.payload_ru == row.payload_ja:
+            if payload_ru == payload_ja:
                 missing_langs.append("ru")
             if not missing_langs:
                 continue
             result.append(
                 {
-                    "listing_id": row.listing_id,
-                    "payload_ja": json.loads(row.payload_ja),
+                    "listing_id": listing_id,
+                    "payload_ja": json.loads(payload_ja),
                     "missing_langs": missing_langs,
                 }
             )
@@ -249,25 +258,30 @@ class Database:
 
         async with self.session_factory() as session:
             rows = (
-                await session.scalars(
-                    select(CarRecord)
+                await session.execute(
+                    select(
+                        CarRecord.listing_id,
+                        CarRecord.payload_ja,
+                        CarRecord.payload_en,
+                        CarRecord.payload_ru,
+                    )
                     .where(CarRecord.listing_id.in_(listing_ids))
                     .order_by(CarRecord.listing_id.asc())
                 )
             ).all()
 
         result: list[dict[str, Any]] = []
-        for row in rows:
+        for listing_id, payload_ja, payload_en, payload_ru in rows:
             missing_langs: list[str] = []
-            if row.payload_en == row.payload_ja:
+            if payload_en == payload_ja:
                 missing_langs.append("en")
-            if row.payload_ru == row.payload_ja:
+            if payload_ru == payload_ja:
                 missing_langs.append("ru")
 
             result.append(
                 {
-                    "listing_id": row.listing_id,
-                    "payload_ja": json.loads(row.payload_ja),
+                    "listing_id": listing_id,
+                    "payload_ja": json.loads(payload_ja),
                     "missing_langs": missing_langs,
                 }
             )
@@ -282,6 +296,7 @@ class Database:
             for key, value in localized_values.items():
                 setattr(record, key, value)
             await session.commit()
+        self._clear_filter_cache()
 
     async def record_failed_result_page(self, *, page_number: int, page_url: str, error: str) -> None:
         timestamp = _utc_now()
@@ -415,17 +430,42 @@ class Database:
             search_columns=[title_column, make_column, model_column, location_column],
         )
         count_query = query.with_only_columns(CarRecord.listing_id).order_by(None)
+        page_query = (
+            select(
+                CarRecord.listing_id.label("listing_id"),
+                CarRecord.source_url.label("url"),
+                title_column.label(title_attr),
+                make_column.label(make_attr),
+                model_column.label(model_attr),
+                location_column.label(location_attr),
+                CarRecord.year.label("year"),
+                CarRecord.mileage_km.label("mileage_km"),
+                CarRecord.base_price_yen.label("base_price_yen"),
+                CarRecord.total_price_yen.label("total_price_yen"),
+                CarRecord.engine_volume_cc.label("engine_volume_cc"),
+                CarRecord.doors.label("doors"),
+                CarRecord.seats.label("seats"),
+                CarRecord.photos_json.label("photos_json"),
+                payload_column.label(payload_attr),
+            )
+            .select_from(CarRecord)
+        )
+        page_query = self._apply_filters(
+            page_query,
+            filters=filters,
+            search_columns=[title_column, make_column, model_column, location_column],
+        )
 
         async with self.session_factory() as session:
             total = await session.scalar(select(func.count()).select_from(count_query.subquery())) or 0
 
             rows = (
-                await session.scalars(
-                    query.order_by(*self._resolve_order_by(sort_by, sort_order))
+                await session.execute(
+                    page_query.order_by(*self._resolve_order_by(sort_by, sort_order))
                     .offset((page - 1) * page_size)
                     .limit(page_size)
                 )
-            ).all()
+            ).mappings().all()
 
             filters_payload = await self._load_filter_options(session, lang)
 
@@ -606,6 +646,10 @@ class Database:
         session: AsyncSession,
         lang: str,
     ) -> dict[str, list[dict[str, str]]]:
+        cached = self._get_cached_filter_options(lang)
+        if cached is not None:
+            return cached
+
         suffix = lang
         filter_map = {
             "makes": (CarRecord.make_key, getattr(CarRecord, f"make_{suffix}")),
@@ -633,11 +677,12 @@ class Database:
                 if value and label
             ]
 
+        self._filter_cache[lang] = (time.monotonic() + self._filter_cache_ttl_seconds, result)
         return result
 
     def _row_to_list_item(
         self,
-        row: CarRecord,
+        row: Mapping[str, Any],
         *,
         payload_column: str,
         title_column: str,
@@ -645,22 +690,22 @@ class Database:
         model_column: str,
         location_column: str,
     ) -> dict[str, Any]:
-        photos = json.loads(row.photos_json)
-        payload = json.loads(getattr(row, payload_column))
+        photos = json.loads(row["photos_json"])
+        payload = json.loads(row[payload_column])
         return {
-            "listing_id": row.listing_id,
-            "url": row.source_url,
-            "title": getattr(row, title_column),
-            "make": getattr(row, make_column),
-            "model": getattr(row, model_column),
-            "location": getattr(row, location_column),
-            "year": row.year,
-            "mileage_km": row.mileage_km,
-            "base_price_yen": row.base_price_yen,
-            "total_price_yen": row.total_price_yen,
-            "engine_volume_cc": row.engine_volume_cc,
-            "doors": row.doors,
-            "seats": row.seats,
+            "listing_id": row["listing_id"],
+            "url": row["url"],
+            "title": row[title_column],
+            "make": row[make_column],
+            "model": row[model_column],
+            "location": row[location_column],
+            "year": row["year"],
+            "mileage_km": row["mileage_km"],
+            "base_price_yen": row["base_price_yen"],
+            "total_price_yen": row["total_price_yen"],
+            "engine_volume_cc": row["engine_volume_cc"],
+            "doors": row["doors"],
+            "seats": row["seats"],
             "photos": photos,
             "main_photo": photos[0] if photos else None,
             "body_type": payload.get("body_type"),
@@ -681,6 +726,20 @@ class Database:
         column = allowed.get(sort_by, CarRecord.synced_at)
         ordered = column.desc() if sort_order == "desc" else column.asc()
         return ordered, CarRecord.listing_id.asc()
+
+    def _get_cached_filter_options(self, lang: str) -> dict[str, list[dict[str, str]]] | None:
+        cached = self._filter_cache.get(lang)
+        if cached is None:
+            return None
+
+        expires_at, payload = cached
+        if time.monotonic() >= expires_at:
+            self._filter_cache.pop(lang, None)
+            return None
+        return payload
+
+    def _clear_filter_cache(self) -> None:
+        self._filter_cache.clear()
 
 
 def _utc_now() -> str:

@@ -58,9 +58,15 @@ class ParserFetchError(RuntimeError):
 
 
 class CarSensorParser:
-    def __init__(self, timeout: int = 30, preview_batch_size: int = 10) -> None:
+    def __init__(
+        self,
+        timeout: int = 30,
+        preview_batch_size: int = 10,
+        request_concurrency: int = 10,
+    ) -> None:
         self.timeout = timeout
         self.preview_batch_size = max(1, preview_batch_size)
+        self.request_concurrency = max(1, request_concurrency)
         self.headers = {
             "User-Agent": USER_AGENT,
             "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -390,7 +396,7 @@ class CarSensorParser:
         return aiohttp.ClientSession(
             headers=self.headers,
             timeout=timeout,
-            connector=aiohttp.TCPConnector(limit=0),
+            connector=aiohttp.TCPConnector(limit=self.request_concurrency),
         )
 
     def _extract_result_page_number(self, url: str) -> int:

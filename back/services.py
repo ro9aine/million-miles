@@ -23,7 +23,6 @@ class SyncService:
         result: dict[str, Any] = {
             "synced": 0,
             "failed": 0,
-            "existing_seen": 0,
             "processed_preview_batches": 0,
             "retried_failed_detail_pages": 0,
             "retried_failed_result_pages": 0,
@@ -138,11 +137,7 @@ class SyncService:
         if not batch:
             return self._limit_reached(result=result, max_listings=max_listings)
 
-        logger.info(
-            "Prepared preview batch size=%s existing_seen=%s",
-            len(batch),
-            result["existing_seen"],
-        )
+        logger.info("Prepared preview batch size=%s", len(batch))
 
         for preview, listing, error in await self.parser.fetch_listings_with_status(batch):
             if error is not None:
@@ -172,11 +167,10 @@ class SyncService:
             await self.database.upsert_car(self._build_record(listing, synced_at))
             result["synced"] += 1
             logger.info(
-                "Upserted listing listing_id=%s synced=%s failed=%s existing_seen=%s",
+                "Upserted listing listing_id=%s synced=%s failed=%s",
                 listing.listing_id,
                 result["synced"],
                 result["failed"],
-                result["existing_seen"],
             )
             if self._limit_reached(result=result, max_listings=max_listings):
                 logger.info("Sync pass reached max_listings result=%s", result)
@@ -197,10 +191,6 @@ class SyncService:
                 return []
             previews = previews[:remaining]
 
-        for preview in previews:
-            listing_id = preview.listing_id or self.parser.extract_listing_id(preview.url)
-            if listing_id and await self.database.has_car(listing_id):
-                result["existing_seen"] += 1
         return previews
 
     def _limit_reached(self, *, result: dict[str, Any], max_listings: int | None) -> bool:
