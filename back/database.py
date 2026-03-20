@@ -414,9 +414,10 @@ class Database:
             filters=filters,
             search_columns=[title_column, make_column, model_column, location_column],
         )
+        count_query = query.with_only_columns(CarRecord.listing_id).order_by(None)
 
         async with self.session_factory() as session:
-            total = await session.scalar(select(func.count()).select_from(query.subquery(CarRecord.listing_id))) or 0
+            total = await session.scalar(select(func.count()).select_from(count_query.subquery())) or 0
 
             rows = (
                 await session.scalars(
