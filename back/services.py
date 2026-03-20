@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import json
 import logging
 from datetime import datetime, timezone
@@ -6,7 +7,7 @@ from typing import Any
 
 from back.database import Database
 from back.localization import slugify_text
-from parser import CarListing, CarSensorParser, ListingPreview, PreviewPageResult
+from parser import CarListing, CarSensorParser, ListingPreview
 
 
 logger = logging.getLogger(__name__)
@@ -37,16 +38,16 @@ class SyncService:
         )
 
         if await self._process_failed_detail_pages(result=result, synced_at=synced_at, max_listings=max_listings):
-            return self._finalize_result(result)
+            return await self._finalize_result(result)
 
         if await self._process_failed_result_pages(result=result, synced_at=synced_at, max_listings=max_listings):
-            return self._finalize_result(result)
+            return await self._finalize_result(result)
 
         async for page_results in self.parser.iter_preview_page_batches(max_pages=max_pages):
             result["processed_preview_batches"] += 1
             for page_result in page_results:
                 if page_result.error is not None:
-                    self.database.record_failed_result_page(
+                    await self.database.record_failed_result_page(
                         page_number=page_result.page_number,
                         page_url=page_result.url,
                         error=page_result.error,
@@ -54,16 +55,16 @@ class SyncService:
                     result["failed"] += 1
                     continue
 
-                self.database.clear_failed_result_page(page_result.page_number)
+                await self.database.clear_failed_result_page(page_result.page_number)
                 if await self._process_previews(
                     page_result.previews,
                     result=result,
                     synced_at=synced_at,
                     max_listings=max_listings,
                 ):
-                    return self._finalize_result(result)
+                    return await self._finalize_result(result)
 
-        result = self._finalize_result(result)
+        result = await self._finalize_result(result)
         logger.info("Sync pass finished result=%s", result)
         return result
 
@@ -74,7 +75,7 @@ class SyncService:
         synced_at: str,
         max_listings: int | None,
     ) -> bool:
-        failed_pages = self.database.list_failed_detail_pages()
+        failed_pages = await self.database.list_failed_detail_pages()
         if not failed_pages:
             return False
 
@@ -98,7 +99,7 @@ class SyncService:
         synced_at: str,
         max_listings: int | None,
     ) -> bool:
-        failed_pages = self.database.list_failed_result_pages()
+        failed_pages = await self.database.list_failed_result_pages()
         if not failed_pages:
             return False
 
@@ -107,7 +108,7 @@ class SyncService:
         logger.info("Retrying failed result pages page_numbers=%s", page_numbers)
         for page_result in await self.parser.fetch_preview_pages(page_numbers):
             if page_result.error is not None:
-                self.database.record_failed_result_page(
+                await self.database.record_failed_result_page(
                     page_number=page_result.page_number,
                     page_url=page_result.url,
                     error=page_result.error,
@@ -115,7 +116,7 @@ class SyncService:
                 result["failed"] += 1
                 continue
 
-            self.database.clear_failed_result_page(page_result.page_number)
+            await self.database.clear_failed_result_page(page_result.page_number)
             if await self._process_previews(
                 page_result.previews,
                 result=result,
@@ -133,7 +134,7 @@ class SyncService:
         synced_at: str,
         max_listings: int | None,
     ) -> bool:
-        batch = self._limit_previews(previews, result=result, max_listings=max_listings)
+        batch = await self._limit_previews(previews, result=result, max_listings=max_listings)
         if not batch:
             return self._limit_reached(result=result, max_listings=max_listings)
 
@@ -146,7 +147,7 @@ class SyncService:
         for preview, listing, error in await self.parser.fetch_listings_with_status(batch):
             if error is not None:
                 result["failed"] += 1
-                self.database.record_failed_detail_page(
+                await self.database.record_failed_detail_page(
                     listing_id=preview.listing_id,
                     listing_url=preview.url,
                     error=str(error),
@@ -159,7 +160,7 @@ class SyncService:
                 continue
             if not listing.listing_id or not listing.url:
                 result["failed"] += 1
-                self.database.record_failed_detail_page(
+                await self.database.record_failed_detail_page(
                     listing_id=preview.listing_id,
                     listing_url=preview.url,
                     error="Missing listing_id or url after detail parse",
@@ -167,8 +168,8 @@ class SyncService:
                 logger.warning("Skipping listing without listing_id or url source=%s", preview.url)
                 continue
 
-            self.database.clear_failed_detail_page(preview.url)
-            self.database.upsert_car(self._build_record(listing, synced_at))
+            await self.database.clear_failed_detail_page(preview.url)
+            await self.database.upsert_car(self._build_record(listing, synced_at))
             result["synced"] += 1
             logger.info(
                 "Upserted listing listing_id=%s synced=%s failed=%s existing_seen=%s",
@@ -178,12 +179,12 @@ class SyncService:
                 result["existing_seen"],
             )
             if self._limit_reached(result=result, max_listings=max_listings):
-                logger.info("Sync pass reached max_listings result=%s", self._finalize_result(result))
+                logger.info("Sync pass reached max_listings result=%s", result)
                 return True
 
         return False
 
-    def _limit_previews(
+    async def _limit_previews(
         self,
         previews: list[ListingPreview],
         *,
@@ -198,16 +199,16 @@ class SyncService:
 
         for preview in previews:
             listing_id = preview.listing_id or self.parser.extract_listing_id(preview.url)
-            if listing_id and self.database.has_car(listing_id):
+            if listing_id and await self.database.has_car(listing_id):
                 result["existing_seen"] += 1
         return previews
 
     def _limit_reached(self, *, result: dict[str, Any], max_listings: int | None) -> bool:
         return max_listings is not None and result["synced"] >= max_listings
 
-    def _finalize_result(self, result: dict[str, Any]) -> dict[str, Any]:
-        result["pending_failed_result_pages"] = self.database.count_failed_result_pages()
-        result["pending_failed_detail_pages"] = self.database.count_failed_detail_pages()
+    async def _finalize_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        result["pending_failed_result_pages"] = await self.database.count_failed_result_pages()
+        result["pending_failed_detail_pages"] = await self.database.count_failed_detail_pages()
         return result
 
     def _build_record(self, listing: CarListing, synced_at: str) -> dict[str, Any]:

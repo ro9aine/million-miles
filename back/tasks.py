@@ -13,14 +13,14 @@ from back.services import SyncService
 from parser import CarSensorParser
 
 
-database = Database(settings.database_path)
+database = Database(settings.database_url)
 sync_service = SyncService(database=database, parser=CarSensorParser())
 JOB_NAME = "carsensor-sync"
 TRANSLATION_JOB_NAME = "carsensor-translation"
 logger = logging.getLogger(__name__)
 
 
-def _translate_sources(sources: list[dict[str, object]]) -> int:
+async def _translate_sources(sources: list[dict[str, object]]) -> int:
     translated = 0
     for source in sources:
         missing_langs = tuple(source.get("missing_langs", []))
@@ -35,20 +35,20 @@ def _translate_sources(sources: list[dict[str, object]]) -> int:
             key: json.dumps(value, ensure_ascii=False) if key.startswith("payload_") else value
             for key, value in localized.items()
         }
-        database.update_car_localizations(source["listing_id"], updates)
+        await database.update_car_localizations(source["listing_id"], updates)
         translated += 1
     return translated
 
 
-def _run_sync(*, force: bool) -> dict[str, str | int | bool]:
-    initialize_runtime(database)
+async def _run_sync_async(*, force: bool) -> dict[str, str | int | bool]:
+    await initialize_runtime(database)
     logger.info(
         "Evaluating sync job %s force=%s interval_seconds=%s",
         JOB_NAME,
         force,
         settings.sync_interval_seconds,
     )
-    should_start = database.start_job_if_due(
+    should_start = await database.start_job_if_due(
         JOB_NAME,
         interval_seconds=settings.sync_interval_seconds,
         force=force,
@@ -65,11 +65,9 @@ def _run_sync(*, force: bool) -> dict[str, str | int | bool]:
             settings.sync_max_pages,
             settings.sync_max_listings,
         )
-        result = asyncio.run(
-            sync_service.sync(
-                max_pages=settings.sync_max_pages,
-                max_listings=settings.sync_max_listings,
-            )
+        result = await sync_service.sync(
+            max_pages=settings.sync_max_pages,
+            max_listings=settings.sync_max_listings,
         )
         succeeded = True
         result["started"] = True
@@ -79,7 +77,14 @@ def _run_sync(*, force: bool) -> dict[str, str | int | bool]:
         logger.exception("Sync job failed")
         raise
     finally:
-        database.finish_job(JOB_NAME, succeeded=succeeded)
+        await database.finish_job(JOB_NAME, succeeded=succeeded)
+
+
+def _run_sync(*, force: bool) -> dict[str, str | int | bool]:
+    try:
+        return asyncio.run(_run_sync_async(force=force))
+    finally:
+        asyncio.run(database.engine.dispose())
 
 
 @celery_app.task(name="back.tasks.ensure_sync_due")
@@ -94,16 +99,15 @@ def sync_cars_now() -> dict[str, str | int | bool]:
     return _run_sync(force=True)
 
 
-@celery_app.task(name="back.tasks.ensure_translation_due")
-def ensure_translation_due() -> dict[str, int | bool]:
-    initialize_runtime(database)
+async def _ensure_translation_due_async() -> dict[str, int | bool]:
+    await initialize_runtime(database)
     logger.info(
         "Evaluating translation job %s interval_seconds=%s batch_size=%s",
         TRANSLATION_JOB_NAME,
         settings.translation_interval_seconds,
         settings.translation_batch_size,
     )
-    should_start = database.start_job_if_due(
+    should_start = await database.start_job_if_due(
         TRANSLATION_JOB_NAME,
         interval_seconds=settings.translation_interval_seconds,
         force=False,
@@ -113,9 +117,9 @@ def ensure_translation_due() -> dict[str, int | bool]:
         return {"started": False, "translated": 0, "missing": 0}
 
     succeeded = False
-    pending = database.get_cars_missing_localization(settings.translation_batch_size)
+    pending = await database.get_cars_missing_localization(settings.translation_batch_size)
     try:
-        translated = _translate_sources(pending)
+        translated = await _translate_sources(pending)
 
         succeeded = True
         result = {
@@ -126,20 +130,26 @@ def ensure_translation_due() -> dict[str, int | bool]:
         logger.info("Completed translation job %s result=%s", TRANSLATION_JOB_NAME, result)
         return result
     finally:
-        database.finish_job(TRANSLATION_JOB_NAME, succeeded=succeeded)
+        await database.finish_job(TRANSLATION_JOB_NAME, succeeded=succeeded)
 
 
-@celery_app.task(name="back.tasks.translate_cars_batch")
-def translate_cars_batch(listing_ids: list[str] | None = None) -> dict[str, int | bool]:
-    initialize_runtime(database)
-    listing_ids = listing_ids or []
+@celery_app.task(name="back.tasks.ensure_translation_due")
+def ensure_translation_due() -> dict[str, int | bool]:
+    try:
+        return asyncio.run(_ensure_translation_due_async())
+    finally:
+        asyncio.run(database.engine.dispose())
+
+
+async def _translate_cars_batch_async(listing_ids: list[str]) -> dict[str, int | bool]:
+    await initialize_runtime(database)
     logger.info("Received compatibility translation task listing_count=%s", len(listing_ids))
 
     if not listing_ids:
         return {"started": False, "translated": 0, "missing": 0}
 
-    sources = database.get_cars_by_listing_ids(listing_ids)
-    translated = _translate_sources(sources)
+    sources = await database.get_cars_by_listing_ids(listing_ids)
+    translated = await _translate_sources(sources)
     result = {
         "started": True,
         "translated": translated,
@@ -147,3 +157,12 @@ def translate_cars_batch(listing_ids: list[str] | None = None) -> dict[str, int 
     }
     logger.info("Completed compatibility translation task result=%s", result)
     return result
+
+
+@celery_app.task(name="back.tasks.translate_cars_batch")
+def translate_cars_batch(listing_ids: list[str] | None = None) -> dict[str, int | bool]:
+    listing_ids = listing_ids or []
+    try:
+        return asyncio.run(_translate_cars_batch_async(listing_ids))
+    finally:
+        asyncio.run(database.engine.dispose())

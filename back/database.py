@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import math
-import threading
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Index, Integer, String, Text, create_engine, func, inspect, or_, select, text
-from sqlalchemy.dialects.sqlite import insert
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy import Index, Integer, String, Text, func, inspect, or_, select, text
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 LANG_COLUMNS = {
@@ -116,9 +115,7 @@ class SyncStateRecord(Base):
 
 class FailedResultPageRecord(Base):
     __tablename__ = "failed_result_pages"
-    __table_args__ = (
-        Index("ix_failed_result_pages_last_failed_at", "last_failed_at"),
-    )
+    __table_args__ = (Index("ix_failed_result_pages_last_failed_at", "last_failed_at"),)
 
     page_number: Mapped[int] = mapped_column(Integer, primary_key=True)
     page_url: Mapped[str] = mapped_column(String, nullable=False)
@@ -144,43 +141,38 @@ class FailedDetailPageRecord(Base):
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_engine(
-            f"sqlite:///{self.path}",
-            connect_args={"check_same_thread": False},
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+        self.engine: AsyncEngine = create_async_engine(
+            database_url,
+            pool_pre_ping=True,
         )
-        self.session_factory = sessionmaker(
+        self.session_factory = async_sessionmaker(
             bind=self.engine,
             autoflush=False,
             expire_on_commit=False,
         )
-        self._write_lock = threading.Lock()
 
-    def init(self) -> None:
-        Base.metadata.create_all(self.engine)
-        self._migrate_schema()
-        self._ensure_declared_indexes()
+    async def init(self) -> None:
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await self._migrate_schema(connection)
 
-    def session(self) -> Session:
-        return self.session_factory()
+    async def seed_user(self, username: str, password_hash: str) -> None:
+        payload = {
+            "username": username,
+            "password_hash": password_hash,
+            "created_at": _utc_now(),
+        }
+        statement = insert(UserRecord).values(**payload)
+        statement = statement.on_conflict_do_nothing(index_elements=["username"])
+        async with self.session_factory() as session:
+            await session.execute(statement)
+            await session.commit()
 
-    def seed_user(self, username: str, password_hash: str) -> None:
-        with self._write_lock, self.session() as session:
-            payload = {
-                "username": username,
-                "password_hash": password_hash,
-                "created_at": _utc_now(),
-            }
-            statement = insert(UserRecord).values(**payload)
-            statement = statement.on_conflict_do_nothing(index_elements=["username"])
-            session.execute(statement)
-            session.commit()
-
-    def get_user(self, username: str) -> dict[str, Any] | None:
-        with self.session() as session:
-            record = session.get(UserRecord, username)
+    async def get_user(self, username: str) -> dict[str, Any] | None:
+        async with self.session_factory() as session:
+            record = await session.get(UserRecord, username)
             if record is None:
                 return None
             return {
@@ -188,47 +180,49 @@ class Database:
                 "password_hash": record.password_hash,
             }
 
-    def upsert_car(self, record: dict[str, Any]) -> None:
-        with self._write_lock, self.session() as session:
-            statement = insert(CarRecord).values(**record)
-            update_map = {
-                key: getattr(statement.excluded, key)
-                for key in record
-                if key != "listing_id"
-            }
-            statement = statement.on_conflict_do_update(
-                index_elements=["listing_id"],
-                set_=update_map,
-            )
-            session.execute(statement)
-            session.commit()
+    async def upsert_car(self, record: dict[str, Any]) -> None:
+        statement = insert(CarRecord).values(**record)
+        update_map = {
+            key: getattr(statement.excluded, key)
+            for key in record
+            if key != "listing_id"
+        }
+        statement = statement.on_conflict_do_update(
+            index_elements=["listing_id"],
+            set_=update_map,
+        )
+        async with self.session_factory() as session:
+            await session.execute(statement)
+            await session.commit()
 
-    def count_cars(self) -> int:
-        with self.session() as session:
-            value = session.scalar(select(func.count()).select_from(CarRecord))
+    async def count_cars(self) -> int:
+        async with self.session_factory() as session:
+            value = await session.scalar(select(func.count()).select_from(CarRecord))
         return int(value or 0)
 
-    def has_car(self, listing_id: str) -> bool:
-        with self.session() as session:
-            value = session.scalar(
+    async def has_car(self, listing_id: str) -> bool:
+        async with self.session_factory() as session:
+            value = await session.scalar(
                 select(func.count())
                 .select_from(CarRecord)
                 .where(CarRecord.listing_id == listing_id)
             )
         return bool(value)
 
-    def get_cars_missing_localization(self, limit: int) -> list[dict[str, Any]]:
-        with self.session() as session:
-            rows = session.scalars(
-                select(CarRecord)
-                .where(
-                    or_(
-                        CarRecord.payload_en == CarRecord.payload_ja,
-                        CarRecord.payload_ru == CarRecord.payload_ja,
+    async def get_cars_missing_localization(self, limit: int) -> list[dict[str, Any]]:
+        async with self.session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(CarRecord)
+                    .where(
+                        or_(
+                            CarRecord.payload_en == CarRecord.payload_ja,
+                            CarRecord.payload_ru == CarRecord.payload_ja,
+                        )
                     )
+                    .order_by(CarRecord.synced_at.asc(), CarRecord.listing_id.asc())
+                    .limit(limit)
                 )
-                .order_by(CarRecord.synced_at.asc(), CarRecord.listing_id.asc())
-                .limit(limit)
             ).all()
 
         result: list[dict[str, Any]] = []
@@ -249,15 +243,17 @@ class Database:
             )
         return result
 
-    def get_cars_by_listing_ids(self, listing_ids: list[str]) -> list[dict[str, Any]]:
+    async def get_cars_by_listing_ids(self, listing_ids: list[str]) -> list[dict[str, Any]]:
         if not listing_ids:
             return []
 
-        with self.session() as session:
-            rows = session.scalars(
-                select(CarRecord)
-                .where(CarRecord.listing_id.in_(listing_ids))
-                .order_by(CarRecord.listing_id.asc())
+        async with self.session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(CarRecord)
+                    .where(CarRecord.listing_id.in_(listing_ids))
+                    .order_by(CarRecord.listing_id.asc())
+                )
             ).all()
 
         result: list[dict[str, Any]] = []
@@ -277,20 +273,20 @@ class Database:
             )
         return result
 
-    def update_car_localizations(self, listing_id: str, localized_values: dict[str, Any]) -> None:
-        with self._write_lock, self.session() as session:
-            record = session.get(CarRecord, listing_id)
+    async def update_car_localizations(self, listing_id: str, localized_values: dict[str, Any]) -> None:
+        async with self.session_factory() as session:
+            record = await session.get(CarRecord, listing_id)
             if record is None:
                 return
 
             for key, value in localized_values.items():
                 setattr(record, key, value)
-            session.commit()
+            await session.commit()
 
-    def record_failed_result_page(self, *, page_number: int, page_url: str, error: str) -> None:
+    async def record_failed_result_page(self, *, page_number: int, page_url: str, error: str) -> None:
         timestamp = _utc_now()
-        with self._write_lock, self.session() as session:
-            record = session.get(FailedResultPageRecord, page_number)
+        async with self.session_factory() as session:
+            record = await session.get(FailedResultPageRecord, page_number)
             if record is None:
                 record = FailedResultPageRecord(
                     page_number=page_number,
@@ -306,24 +302,25 @@ class Database:
                 record.last_error = error
                 record.attempts += 1
                 record.last_failed_at = timestamp
-            session.commit()
+            await session.commit()
 
-    def clear_failed_result_page(self, page_number: int) -> None:
-        with self._write_lock, self.session() as session:
-            record = session.get(FailedResultPageRecord, page_number)
+    async def clear_failed_result_page(self, page_number: int) -> None:
+        async with self.session_factory() as session:
+            record = await session.get(FailedResultPageRecord, page_number)
             if record is not None:
-                session.delete(record)
-                session.commit()
+                await session.delete(record)
+                await session.commit()
 
-    def list_failed_result_pages(self, limit: int | None = None) -> list[dict[str, Any]]:
-        with self.session() as session:
-            query = select(FailedResultPageRecord).order_by(
-                FailedResultPageRecord.last_failed_at.asc(),
-                FailedResultPageRecord.page_number.asc(),
-            )
-            if limit is not None:
-                query = query.limit(limit)
-            rows = session.scalars(query).all()
+    async def list_failed_result_pages(self, limit: int | None = None) -> list[dict[str, Any]]:
+        query = select(FailedResultPageRecord).order_by(
+            FailedResultPageRecord.last_failed_at.asc(),
+            FailedResultPageRecord.page_number.asc(),
+        )
+        if limit is not None:
+            query = query.limit(limit)
+
+        async with self.session_factory() as session:
+            rows = (await session.scalars(query)).all()
 
         return [
             {
@@ -335,15 +332,15 @@ class Database:
             for row in rows
         ]
 
-    def count_failed_result_pages(self) -> int:
-        with self.session() as session:
-            value = session.scalar(select(func.count()).select_from(FailedResultPageRecord))
+    async def count_failed_result_pages(self) -> int:
+        async with self.session_factory() as session:
+            value = await session.scalar(select(func.count()).select_from(FailedResultPageRecord))
         return int(value or 0)
 
-    def record_failed_detail_page(self, *, listing_id: str | None, listing_url: str, error: str) -> None:
+    async def record_failed_detail_page(self, *, listing_id: str | None, listing_url: str, error: str) -> None:
         timestamp = _utc_now()
-        with self._write_lock, self.session() as session:
-            record = session.get(FailedDetailPageRecord, listing_url)
+        async with self.session_factory() as session:
+            record = await session.get(FailedDetailPageRecord, listing_url)
             if record is None:
                 record = FailedDetailPageRecord(
                     listing_url=listing_url,
@@ -359,24 +356,25 @@ class Database:
                 record.last_error = error
                 record.attempts += 1
                 record.last_failed_at = timestamp
-            session.commit()
+            await session.commit()
 
-    def clear_failed_detail_page(self, listing_url: str) -> None:
-        with self._write_lock, self.session() as session:
-            record = session.get(FailedDetailPageRecord, listing_url)
+    async def clear_failed_detail_page(self, listing_url: str) -> None:
+        async with self.session_factory() as session:
+            record = await session.get(FailedDetailPageRecord, listing_url)
             if record is not None:
-                session.delete(record)
-                session.commit()
+                await session.delete(record)
+                await session.commit()
 
-    def list_failed_detail_pages(self, limit: int | None = None) -> list[dict[str, Any]]:
-        with self.session() as session:
-            query = select(FailedDetailPageRecord).order_by(
-                FailedDetailPageRecord.last_failed_at.asc(),
-                FailedDetailPageRecord.listing_url.asc(),
-            )
-            if limit is not None:
-                query = query.limit(limit)
-            rows = session.scalars(query).all()
+    async def list_failed_detail_pages(self, limit: int | None = None) -> list[dict[str, Any]]:
+        query = select(FailedDetailPageRecord).order_by(
+            FailedDetailPageRecord.last_failed_at.asc(),
+            FailedDetailPageRecord.listing_url.asc(),
+        )
+        if limit is not None:
+            query = query.limit(limit)
+
+        async with self.session_factory() as session:
+            rows = (await session.scalars(query)).all()
 
         return [
             {
@@ -388,12 +386,12 @@ class Database:
             for row in rows
         ]
 
-    def count_failed_detail_pages(self) -> int:
-        with self.session() as session:
-            value = session.scalar(select(func.count()).select_from(FailedDetailPageRecord))
+    async def count_failed_detail_pages(self) -> int:
+        async with self.session_factory() as session:
+            value = await session.scalar(select(func.count()).select_from(FailedDetailPageRecord))
         return int(value or 0)
 
-    def list_cars(
+    async def list_cars(
         self,
         *,
         lang: str,
@@ -417,18 +415,18 @@ class Database:
             search_columns=[title_column, make_column, model_column, location_column],
         )
 
-        with self.session() as session:
-            total = session.scalar(
-                select(func.count()).select_from(query.subquery())
-            ) or 0
+        async with self.session_factory() as session:
+            total = await session.scalar(select(func.count()).select_from(query.subquery(CarRecord.listing_id))) or 0
 
-            rows = session.scalars(
-                query.order_by(*self._resolve_order_by(sort_by, sort_order))
-                .offset((page - 1) * page_size)
-                .limit(page_size)
+            rows = (
+                await session.scalars(
+                    query.order_by(*self._resolve_order_by(sort_by, sort_order))
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
             ).all()
 
-            filters_payload = self._load_filter_options(session, lang)
+            filters_payload = await self._load_filter_options(session, lang)
 
         items = [
             self._row_to_list_item(
@@ -452,26 +450,32 @@ class Database:
             "available_filters": filters_payload,
         }
 
-    def get_car(self, listing_id: str, lang: str) -> dict[str, Any] | None:
+    async def get_car(self, listing_id: str, lang: str) -> dict[str, Any] | None:
         payload_column = LANG_COLUMNS[lang][0]
-        with self.session() as session:
-            record = session.get(CarRecord, listing_id)
+        async with self.session_factory() as session:
+            record = await session.get(CarRecord, listing_id)
             if record is None:
                 return None
             return json.loads(getattr(record, payload_column))
 
-    def get_sync_meta(self) -> dict[str, Any]:
-        with self.session() as session:
-            count = session.scalar(select(func.count()).select_from(CarRecord)) or 0
-            last_synced_at = session.scalar(select(func.max(CarRecord.synced_at)))
+    async def get_sync_meta(self) -> dict[str, Any]:
+        async with self.session_factory() as session:
+            count = await session.scalar(select(func.count()).select_from(CarRecord)) or 0
+            last_synced_at = await session.scalar(select(func.max(CarRecord.synced_at)))
+            failed_result_pages = await session.scalar(
+                select(func.count()).select_from(FailedResultPageRecord)
+            ) or 0
+            failed_detail_pages = await session.scalar(
+                select(func.count()).select_from(FailedDetailPageRecord)
+            ) or 0
         return {
             "count": int(count),
             "last_synced_at": last_synced_at,
-            "failed_result_pages": self.count_failed_result_pages(),
-            "failed_detail_pages": self.count_failed_detail_pages(),
+            "failed_result_pages": int(failed_result_pages),
+            "failed_detail_pages": int(failed_detail_pages),
         }
 
-    def start_job_if_due(
+    async def start_job_if_due(
         self,
         job_name: str,
         *,
@@ -480,60 +484,75 @@ class Database:
     ) -> bool:
         now = datetime.now(timezone.utc)
 
-        with self._write_lock, self.session() as session:
-            state = session.get(SyncStateRecord, job_name)
-            if state is None:
-                state = SyncStateRecord(job_name=job_name, is_running=0)
-                session.add(state)
-                session.flush()
+        async with self.session_factory() as session:
+            async with session.begin():
+                insert_statement = insert(SyncStateRecord).values(
+                    job_name=job_name,
+                    is_running=0,
+                )
+                insert_statement = insert_statement.on_conflict_do_nothing(index_elements=["job_name"])
+                await session.execute(insert_statement)
 
-            if state.is_running:
-                if force:
-                    state.is_running = 0
-                else:
-                    session.rollback()
+                state = await session.scalar(
+                    select(SyncStateRecord)
+                    .where(SyncStateRecord.job_name == job_name)
+                    .with_for_update()
+                )
+                if state is None:
                     return False
 
-            if not force and state.last_succeeded_at:
-                last_succeeded_at = datetime.fromisoformat(state.last_succeeded_at)
-                if (now - last_succeeded_at).total_seconds() < interval_seconds:
-                    session.rollback()
-                    return False
+                if state.is_running:
+                    if force:
+                        state.is_running = 0
+                    else:
+                        return False
 
-            state.is_running = 1
-            state.last_started_at = now.isoformat()
-            session.commit()
+                if not force and state.last_succeeded_at:
+                    last_succeeded_at = datetime.fromisoformat(state.last_succeeded_at)
+                    if (now - last_succeeded_at).total_seconds() < interval_seconds:
+                        return False
+
+                state.is_running = 1
+                state.last_started_at = now.isoformat()
+
+            await session.commit()
             return True
 
-    def finish_job(self, job_name: str, *, succeeded: bool) -> None:
-        with self._write_lock, self.session() as session:
-            state = session.get(SyncStateRecord, job_name)
-            if state is None:
-                state = SyncStateRecord(job_name=job_name)
-                session.add(state)
-            state.is_running = 0
-            state.last_finished_at = _utc_now()
-            if succeeded:
-                state.last_succeeded_at = state.last_finished_at
-            session.commit()
+    async def finish_job(self, job_name: str, *, succeeded: bool) -> None:
+        async with self.session_factory() as session:
+            async with session.begin():
+                insert_statement = insert(SyncStateRecord).values(job_name=job_name, is_running=0)
+                insert_statement = insert_statement.on_conflict_do_nothing(index_elements=["job_name"])
+                await session.execute(insert_statement)
 
-    def _migrate_schema(self) -> None:
-        inspector = inspect(self.engine)
-        tables = set(inspector.get_table_names())
-        if "sync_state" not in tables:
+                state = await session.scalar(
+                    select(SyncStateRecord)
+                    .where(SyncStateRecord.job_name == job_name)
+                    .with_for_update()
+                )
+                if state is None:
+                    return
+
+                state.is_running = 0
+                state.last_finished_at = _utc_now()
+                if succeeded:
+                    state.last_succeeded_at = state.last_finished_at
+
+            await session.commit()
+
+    async def _migrate_schema(self, connection) -> None:
+        def inspect_columns(sync_connection) -> set[str] | None:
+            inspector = inspect(sync_connection)
+            tables = set(inspector.get_table_names())
+            if "sync_state" not in tables:
+                return None
+            return {column["name"] for column in inspector.get_columns("sync_state")}
+
+        columns = await connection.run_sync(inspect_columns)
+        if columns is None or "last_succeeded_at" in columns:
             return
 
-        columns = {column["name"] for column in inspector.get_columns("sync_state")}
-        if "last_succeeded_at" in columns:
-            return
-
-        with self.engine.begin() as connection:
-            connection.execute(text("ALTER TABLE sync_state ADD COLUMN last_succeeded_at VARCHAR"))
-
-    def _ensure_declared_indexes(self) -> None:
-        for table in Base.metadata.sorted_tables:
-            for index in table.indexes:
-                index.create(self.engine, checkfirst=True)
+        await connection.execute(text("ALTER TABLE sync_state ADD COLUMN last_succeeded_at VARCHAR"))
 
     def _apply_filters(
         self,
@@ -581,7 +600,11 @@ class Database:
                 query = query.where(column <= value)
         return query
 
-    def _load_filter_options(self, session: Session, lang: str) -> dict[str, list[dict[str, str]]]:
+    async def _load_filter_options(
+        self,
+        session: AsyncSession,
+        lang: str,
+    ) -> dict[str, list[dict[str, str]]]:
         suffix = lang
         filter_map = {
             "makes": (CarRecord.make_key, getattr(CarRecord, f"make_{suffix}")),
@@ -595,11 +618,13 @@ class Database:
         result: dict[str, list[dict[str, str]]] = {}
 
         for key, (value_column, label_column) in filter_map.items():
-            rows = session.execute(
-                select(value_column, label_column)
-                .where(value_column.is_not(None), label_column.is_not(None))
-                .distinct()
-                .order_by(label_column.asc())
+            rows = (
+                await session.execute(
+                    select(value_column, label_column)
+                    .where(value_column.is_not(None), label_column.is_not(None))
+                    .distinct()
+                    .order_by(label_column.asc())
+                )
             ).all()
             result[key] = [
                 {"value": value, "label": label}

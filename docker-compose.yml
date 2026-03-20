@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: million-miles-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-million_miles}
+      POSTGRES_USER: ${POSTGRES_USER:-million_miles}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-million_miles}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-million_miles} -d ${POSTGRES_DB:-million_miles}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     container_name: million-miles-redis
@@ -15,16 +33,17 @@ services:
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      DATABASE_PATH: /app/back/data/million_miles.db
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-million_miles}:${POSTGRES_PASSWORD:-million_miles}@postgres:5432/${POSTGRES_DB:-million_miles}
       STARTUP_SYNC_ENABLED: ${STARTUP_SYNC_ENABLED:-1}
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
     ports:
       - "8000:8000"
-    volumes:
-      - backend_data:/app/back/data
     depends_on:
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     restart: unless-stopped
     command:
       - uvicorn
@@ -42,13 +61,15 @@ services:
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      DATABASE_PATH: /app/back/data/million_miles.db
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-million_miles}:${POSTGRES_PASSWORD:-million_miles}@postgres:5432/${POSTGRES_DB:-million_miles}
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
-    volumes:
-      - backend_data:/app/back/data
     depends_on:
-      - redis
-      - api
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      api:
+        condition: service_started
     restart: unless-stopped
     command:
       - python
@@ -68,14 +89,17 @@ services:
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      DATABASE_PATH: /app/back/data/million_miles.db
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-million_miles}:${POSTGRES_PASSWORD:-million_miles}@postgres:5432/${POSTGRES_DB:-million_miles}
       SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-3600}
     volumes:
-      - backend_data:/app/back/data
       - beat_state:/app/.celery
     depends_on:
-      - redis
-      - worker
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      worker:
+        condition: service_started
     restart: unless-stopped
     command:
       - python
@@ -102,5 +126,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  backend_data:
+  postgres_data:
   beat_state:

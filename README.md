@@ -1,12 +1,12 @@
 # Million Miles
 
-Test fullstack application for importing cars from `carsensor.net`, storing them in SQLite, exposing them through FastAPI, and browsing them in Next.js.
+Test fullstack application for importing cars from `carsensor.net`, storing them in PostgreSQL, exposing them through FastAPI, and browsing them in Next.js.
 
 ## Implemented
 
 - live `CarSensorParser` based on `requests` and `BeautifulSoup`
 - field content localization to `ja`, `en`, `ru`
-- SQLite storage
+- PostgreSQL storage with async SQLAlchemy + `asyncpg`
 - JWT auth with `admin / admin123`
 - FastAPI backend:
   - `POST /auth/login`
@@ -40,7 +40,7 @@ poetry run back-dev
 
 By default backend:
 
-- initializes SQLite at `back/data/million_miles.db`
+- connects to PostgreSQL via `DATABASE_URL`
 - creates user `admin / admin123`
 - if `STARTUP_SYNC_ENABLED=1`, enqueues immediate sync-check task into Celery
 
@@ -56,7 +56,7 @@ SYNC_INTERVAL_SECONDS=3600
 SYNC_MAX_PAGES=2
 SYNC_MAX_LISTINGS=40
 STARTUP_SYNC_ENABLED=1
-DATABASE_PATH=back/data/million_miles.db
+DATABASE_URL=postgresql+asyncpg://million_miles:million_miles@127.0.0.1:5432/million_miles
 ```
 
 Healthcheck:
@@ -67,12 +67,18 @@ http://localhost:8000/health
 
 ## Celery
 
-Redis is required as broker/backend.
+Redis is required as broker/backend. PostgreSQL is required as the application database.
 
 Example local Redis with Docker:
 
 ```bash
 docker run --name million-miles-redis -p 6379:6379 redis:7
+```
+
+Example local PostgreSQL with Docker:
+
+```bash
+docker run --name million-miles-postgres -e POSTGRES_DB=million_miles -e POSTGRES_USER=million_miles -e POSTGRES_PASSWORD=million_miles -p 5432:5432 postgres:16
 ```
 
 Run worker:
@@ -142,7 +148,7 @@ npm run dev
 
 ## Docker Compose
 
-Full stack with Redis, API, Celery worker, Celery beat, and frontend:
+Full stack with PostgreSQL, Redis, API, Celery worker, Celery beat, and frontend:
 
 ```bash
 docker compose up --build
@@ -165,6 +171,9 @@ NEXT_PUBLIC_API_URL=http://your-server:8000
 AUTH_COOKIE_SECURE=false
 STARTUP_SYNC_ENABLED=1
 SYNC_INTERVAL_SECONDS=3600
+POSTGRES_DB=million_miles
+POSTGRES_USER=million_miles
+POSTGRES_PASSWORD=change-me
 ```
 
 Set `AUTH_COOKIE_SECURE=false` only when serving over plain HTTP. For HTTPS deployments,
@@ -174,6 +183,7 @@ Services:
 
 - frontend: `http://localhost:3000`
 - api: `http://localhost:8000`
+- postgres: `localhost:5432`
 - redis: `localhost:6379`
 
 Stop:

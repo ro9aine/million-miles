@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -29,7 +27,9 @@ class Settings(BaseSettings):
     startup_sync_enabled: bool = True
     celery_broker_url: str = "redis://127.0.0.1:6379/0"
     celery_result_backend: str | None = None
-    database_path: Path = Field(default=Path("back") / "data" / "million_miles.db")
+    database_url: str = Field(
+        default="postgresql+asyncpg://million_miles:million_miles@127.0.0.1:5432/million_miles"
+    )
 
     @property
     def resolved_celery_result_backend(self) -> str:

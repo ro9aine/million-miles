@@ -23,18 +23,19 @@ from back.schemas import (
 )
 
 
-database = Database(settings.database_path)
+database = Database(settings.database_url)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    initialize_runtime(database)
+    await initialize_runtime(database)
     if settings.startup_sync_enabled:
         try:
             celery_app.send_task("back.tasks.ensure_sync_due")
         except Exception:
             pass
     yield
+    await database.engine.dispose()
 
 
 app = FastAPI(title=settings.api_title, lifespan=lifespan)
@@ -50,13 +51,13 @@ app.add_middleware(
 
 @app.get("/health", tags=["system"])
 async def healthcheck() -> dict[str, str | int | None]:
-    meta = database.get_sync_meta()
+    meta = await database.get_sync_meta()
     return {"status": "ok", **meta}
 
 
 @app.post("/auth/login", response_model=TokenResponse, tags=["auth"])
 async def login(payload: LoginRequest, response: Response) -> TokenResponse:
-    user = database.get_user(payload.username)
+    user = await database.get_user(payload.username)
     if not user or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -117,7 +118,7 @@ async def list_cars(
     sort_by: SortBy = "synced_at",
     sort_order: SortOrder = "desc",
 ) -> CarListResponse:
-    payload = database.list_cars(
+    payload = await database.list_cars(
         lang=lang,
         page=page,
         page_size=page_size,
@@ -148,7 +149,7 @@ async def get_car(
     listing_id: str,
     lang: str = Query("en", pattern="^(ja|en|ru)$"),
 ) -> CarDetailResponse:
-    item = database.get_car(listing_id, lang)
+    item = await database.get_car(listing_id, lang)
     if not item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Car not found.")
     return CarDetailResponse(item=item)
@@ -162,4 +163,4 @@ async def sync_now() -> SyncResponse:
 
 @app.get("/sync/meta", response_model=SyncMetaResponse, tags=["system"], dependencies=[Depends(require_auth)])
 async def sync_meta() -> SyncMetaResponse:
-    return SyncMetaResponse.model_validate(database.get_sync_meta())
+    return SyncMetaResponse.model_validate(await database.get_sync_meta())
